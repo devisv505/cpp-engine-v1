@@ -8,6 +8,7 @@ namespace engine {
 
 struct Scene2D;
 struct WorldConfig;
+struct Environment;
 class TileRegistry;
 class Window;
 
@@ -39,6 +40,11 @@ public:
     // shorthand auto-defines tile types named "color_1", "color_2", ...
     // Call after RunFile; `registry` must not be frozen yet.
     bool ReadWorldConfig(WorldConfig& config, TileRegistry& registry);
+
+    // Reads the `map_environment` global: walls and lights. Positions and
+    // sizes are written in tile units by scripts and converted to world pixels
+    // here using `tileSizePx`.
+    bool ReadEnvironment(Environment& environment, float tileSizePx);
 
     // What the bound engine functions operate on; each one receives a pointer
     // to it as a closure upvalue.

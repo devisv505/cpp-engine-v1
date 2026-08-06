@@ -26,6 +26,11 @@ public:
                           int mapWidth) override;
     void DrawTileMap(const TileDrawConstants& constants) override;
 
+    void SetOccluders(const Wall* walls, int wallCount, float originX, float originY,
+                      float worldWidth, float worldHeight) override;
+    void DrawWalls(const Wall* walls, int wallCount) override;
+    void DrawLighting(const Light* lights, int lightCount,
+                      const TileDrawConstants& camera) override;
 
     const char* GetBackendName() const override { return "Vulkan"; }
 
@@ -57,9 +62,11 @@ private:
 
     // One sampled image (optimal tiling, device-local) plus its view. Writes
     // whatever it managed to create into the out-params so a failed call can
-    // still be cleaned up with DestroyTileImages().
-    bool CreateTileImage(VkFormat format, uint32_t width, uint32_t height,
-                         VkImage& image, VkDeviceMemory& memory, VkImageView& view);
+    // still be cleaned up by the caller's own destroy path. `usage` covers the
+    // tile textures (transfer destination) and the occlusion mask (rendered to).
+    bool CreateSampledImage(VkFormat format, uint32_t width, uint32_t height,
+                            VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& memory,
+                            VkImageView& view);
 
     // Host-visible, host-coherent TRANSFER_SRC buffer, left persistently mapped.
     bool CreateStagingBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory,
@@ -75,6 +82,34 @@ private:
     // Records the queued tile-id rows into the frame's command buffer. Called
     // by BeginFrame after the fence wait and before the render pass begins.
     void FlushPendingTileUpload(VkCommandBuffer commandBuffer);
+
+    // Lighting objects that survive occluder rebuilds (the mask render pass and
+    // occluder pipeline, the sampler, set layout, pool and set, and the light
+    // resumes from a partial earlier failure. Requires Init() to have completed.
+    bool CreateLightingPipelineObjects();
+
+    // The R8_UNORM occlusion mask plus its view and framebuffer, at the given
+    // resolution. Writes whatever it managed to create into the members so a
+    // failed call can still be cleaned up with DestroyOcclusionMask().
+    bool CreateOcclusionMask(uint32_t width, uint32_t height);
+
+    // Clears the mask and rasterizes every light-blocking wall into it on a
+    // one-shot command buffer, then waits for the queue. The render pass leaves
+    // the image in SHADER_READ_ONLY_OPTIMAL, so no extra barrier is needed.
+    bool RasterizeOccluders(const Wall* walls, int wallCount);
+
+    // Per-mask objects only (image, memory, view, framebuffer); the cached
+    // pipeline objects stay. Callers wait for the device first.
+    void DestroyOcclusionMask();
+
+    // One pipeline whose vertices come from gl_VertexIndex alone: no vertex
+    // input, one color attachment, dynamic viewport and scissor. Shared by the
+    // blending and target render pass.
+    bool CreateVertexlessPipeline(const char* vertexPath, const char* fragmentPath,
+                                  VkPrimitiveTopology topology,
+                                  const VkPipelineColorBlendAttachmentState& blend,
+                                  VkPipelineLayout layout, VkRenderPass renderPass,
+                                  VkPipeline& pipeline);
 
     VkShaderModule LoadShaderModule(const char* relativePath) const;
 
@@ -146,6 +181,40 @@ private:
     int  m_dirtyRowBegin     = 0;
     int  m_dirtyRowEnd       = 0;
 
+    // --- Volumetric lighting ----------------------------------------------
+    // Cached across occluder rebuilds; created lazily by the first
+    // pipelines hang off m_renderPass, which survives swapchain recreation, so
+    // a resize leaves all of this alone.
+    VkRenderPass     m_maskRenderPass         = VK_NULL_HANDLE;  // R8_UNORM, one subpass
+    VkPipelineLayout m_occluderPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline       m_occluderPipeline       = VK_NULL_HANDLE;
+
+    VkSampler             m_lightSampler        = VK_NULL_HANDLE;  // linear, clamp to edge
+    VkDescriptorSetLayout m_lightSetLayout      = VK_NULL_HANDLE;
+    VkDescriptorPool      m_lightDescriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet       m_lightDescriptorSet  = VK_NULL_HANDLE;  // freed with the pool
+    VkPipelineLayout      m_lightPipelineLayout = VK_NULL_HANDLE;  // shared by both pipelines
+    VkPipeline            m_lightPipeline       = VK_NULL_HANDLE;  // additive
+
+    // The mask itself, replaced whenever SetOccluders runs.
+    VkImage        m_maskImage       = VK_NULL_HANDLE;  // R8_UNORM, 1 = blocks light
+    VkDeviceMemory m_maskMemory      = VK_NULL_HANDLE;
+    VkImageView    m_maskView        = VK_NULL_HANDLE;
+    VkFramebuffer  m_maskFramebuffer = VK_NULL_HANDLE;
+
+    // The world rectangle the mask covers and its resolution. The light shader
+    // needs the rectangle to turn a world position into a mask UV.
+    float    m_maskOriginX = 0.0f;
+    float    m_maskOriginY = 0.0f;
+    float    m_maskWorldW  = 1.0f;
+    float    m_maskWorldH  = 1.0f;
+    uint32_t m_maskWidth   = 0;
+    uint32_t m_maskHeight  = 0;
+    bool     m_maskReady   = false;  // false makes DrawLighting a no-op
+
+    // The last camera DrawTileMap was given: DrawWalls has no camera of its own
+    // and transforms its world-space rectangles with this one.
+    TileDrawConstants m_cameraConstants{};
 
     uint32_t m_frameIndex    = 0;
     uint32_t m_imageIndex    = 0;

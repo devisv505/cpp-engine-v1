@@ -6,8 +6,13 @@
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_metal.h>
 
+#include <algorithm>
+#include <cmath>
+
 #include "core/Log.h"
+#include "core/Paths.h"
 #include "core/Window.h"
+#include "world/Environment.h"
 #include "world/TileAtlas.h"
 
 // Available under ARC and, unlike an @autoreleasepool block, a pool pushed here
@@ -16,100 +21,6 @@ extern "C" void* objc_autoreleasePoolPush(void);
 extern "C" void  objc_autoreleasePoolPop(void* token);
 
 namespace engine {
-
-namespace {
-
-// Quads are generated from the vertex id, so no vertex buffers are involved.
-// Metal clip space is Y-up, hence the flip from top-left pixel coordinates.
-constexpr const char* kShaderSource = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-struct QuadConstants {
-    float4 rect;      // x, y, w, h in pixels
-    float4 color;
-    float2 viewport;  // framebuffer size in pixels
-    float2 padding;
-};
-
-struct VertexOut {
-    float4 position [[position]];
-    float4 color;
-};
-
-vertex VertexOut quad_vertex(uint vertexId [[vertex_id]],
-                             constant QuadConstants& constants [[buffer(0)]])
-{
-    float2 corner = float2(float(vertexId & 1u), float((vertexId >> 1) & 1u));
-    float2 pixel  = constants.rect.xy + corner * constants.rect.zw;
-
-    VertexOut out;
-    out.position = float4(pixel.x / constants.viewport.x * 2.0 - 1.0,
-                          1.0 - pixel.y / constants.viewport.y * 2.0,
-                          0.0, 1.0);
-    out.color = constants.color;
-    return out;
-}
-
-fragment float4 quad_fragment(VertexOut in [[stage_in]])
-{
-    return in.color;
-}
-)";
-
-// One fullscreen pass renders the entire visible map: each fragment finds its
-// world tile from the camera, fetches the id, and resolves the tile's color
-// or atlas texture through the palette. Layout mirrors TileDrawConstants.
-constexpr const char* kTileShaderSource = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-struct TileConstants {
-    float2 camera;
-    float  zoom;
-    float  tileSizePx;
-    float2 viewport;
-    float2 mapSize;
-    float4 background;
-    float4 padding;
-};
-
-vertex float4 tile_vertex(uint vertexId [[vertex_id]])
-{
-    // Fullscreen triangle: (-1,-1) (3,-1) (-1,3).
-    float2 corner = float2(float((vertexId << 1) & 2u), float(vertexId & 2u));
-    return float4(corner * 2.0 - 1.0, 0.0, 1.0);
-}
-
-fragment float4 tile_fragment(float4 position [[position]],
-                              constant TileConstants& c [[buffer(0)]],
-                              texture2d<uint>  tileIds [[texture(0)]],
-                              texture2d<float> atlas   [[texture(1)]],
-                              texture2d<float> palette [[texture(2)]])
-{
-    float2 worldPx  = c.camera + (position.xy - c.viewport * 0.5) / c.zoom;
-    float2 tilePos  = floor(worldPx / c.tileSizePx);
-    if (tilePos.x < 0.0 || tilePos.y < 0.0 ||
-        tilePos.x >= c.mapSize.x || tilePos.y >= c.mapSize.y) {
-        return c.background;
-    }
-
-    uint id = min(tileIds.read(uint2(tilePos)).r, 255u);
-    float4 colorRow = palette.read(uint2(id, 0));
-    float4 uvRow    = palette.read(uint2(id, 1));
-
-    float3 result = colorRow.rgb;
-    if (colorRow.a > 0.5) {
-        constexpr sampler pointClamp(filter::nearest, address::clamp_to_edge);
-        float2 f  = fract(worldPx / c.tileSizePx);
-        float2 uv = mix(uvRow.xy, uvRow.zw, f);
-        result = atlas.sample(pointClamp, uv).rgb * colorRow.rgb;
-    }
-    return float4(result, 1.0);
-}
-)";
-
-} // namespace
 
 struct MetalState {
     id<MTLDevice>              device   = nil;
@@ -124,6 +35,18 @@ struct MetalState {
     id<MTLTexture>             tileIdTex    = nil;
     id<MTLTexture>             atlasTex     = nil;
     id<MTLTexture>             paletteTex   = nil;
+
+    // Volumetric lighting. The occlusion mask is cached in world space and
+    // rebuilt only when the wall set changes.
+    id<MTLRenderPipelineState> occluderPipeline = nil;
+    id<MTLRenderPipelineState> lightPipeline    = nil;
+    id<MTLTexture>             occlusionMask    = nil;
+    float maskOriginX = 0.0f, maskOriginY = 0.0f;
+    float maskWidth   = 1.0f, maskHeight   = 1.0f;
+
+    // Camera from the most recent DrawTileMap, reused to place world-space
+    // quads (walls) without threading it through every call.
+    float cameraX = 0.0f, cameraY = 0.0f, cameraZoom = 1.0f;
 
     // Valid only between BeginFrame and EndFrame.
     id<CAMetalDrawable>         drawable       = nil;
@@ -182,7 +105,7 @@ bool MetalRenderer::Init(Window& window)
 
     NSError* error = nil;
     id<MTLLibrary> library =
-        [m_state->device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource]
+        [m_state->device newLibraryWithSource:[NSString stringWithUTF8String:LoadTextFile(ResolveDataPath("shaders/metal/quad.metal")).c_str()]
                                       options:nil
                                         error:&error];
     if (!library) {
@@ -206,7 +129,7 @@ bool MetalRenderer::Init(Window& window)
     }
 
     id<MTLLibrary> tileLibrary =
-        [m_state->device newLibraryWithSource:[NSString stringWithUTF8String:kTileShaderSource]
+        [m_state->device newLibraryWithSource:[NSString stringWithUTF8String:LoadTextFile(ResolveDataPath("shaders/metal/tile.metal")).c_str()]
                                       options:nil
                                         error:&error];
     if (!tileLibrary) {
@@ -229,8 +152,75 @@ bool MetalRenderer::Init(Window& window)
         return false;
     }
 
-    LOG_INFO("[Metal] Swapchain and quad pipeline ready (%dx%d, vsync %s)",
+    if (!CreateLightingPipelines()) {
+        return false;
+    }
+
+    LOG_INFO("[Metal] Swapchain, tile and lighting pipelines ready (%dx%d, vsync %s)",
              pixelWidth, pixelHeight, window.GetConfig().vsync ? "on" : "off");
+    return true;
+}
+
+bool MetalRenderer::CreateLightingPipelines()
+{
+    NSError* error = nil;
+
+    id<MTLLibrary> occluderLibrary =
+        [m_state->device newLibraryWithSource:[NSString stringWithUTF8String:LoadTextFile(ResolveDataPath("shaders/metal/occluder.metal")).c_str()]
+                                      options:nil
+                                        error:&error];
+    if (!occluderLibrary) {
+        LOG_ERROR("[Metal] Occluder shader compilation failed: %s",
+                  [[error localizedDescription] UTF8String]);
+        return false;
+    }
+
+    MTLRenderPipelineDescriptor* occluder = [[MTLRenderPipelineDescriptor alloc] init];
+    occluder.label                           = @"engine.occluder";
+    occluder.vertexFunction                  = [occluderLibrary newFunctionWithName:@"occluder_vertex"];
+    occluder.fragmentFunction                = [occluderLibrary newFunctionWithName:@"occluder_fragment"];
+    occluder.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
+    m_state->occluderPipeline =
+        [m_state->device newRenderPipelineStateWithDescriptor:occluder error:&error];
+    if (!m_state->occluderPipeline) {
+        LOG_ERROR("[Metal] Occluder pipeline failed: %s",
+                  [[error localizedDescription] UTF8String]);
+        return false;
+    }
+
+    id<MTLLibrary> lightLibrary =
+        [m_state->device newLibraryWithSource:[NSString stringWithUTF8String:LoadTextFile(ResolveDataPath("shaders/metal/lighting.metal")).c_str()]
+                                      options:nil
+                                        error:&error];
+    if (!lightLibrary) {
+        LOG_ERROR("[Metal] Light shader compilation failed: %s",
+                  [[error localizedDescription] UTF8String]);
+        return false;
+    }
+
+    // Lights accumulate additively into the scene.
+    MTLRenderPipelineDescriptor* light = [[MTLRenderPipelineDescriptor alloc] init];
+    light.label                                            = @"engine.light";
+    light.vertexFunction                                   = [lightLibrary newFunctionWithName:@"fullscreen_vertex"];
+    light.fragmentFunction                                 = [lightLibrary newFunctionWithName:@"light_fragment"];
+    light.colorAttachments[0].pixelFormat                  = m_state->layer.pixelFormat;
+    light.colorAttachments[0].blendingEnabled              = YES;
+    light.colorAttachments[0].rgbBlendOperation            = MTLBlendOperationAdd;
+    light.colorAttachments[0].alphaBlendOperation          = MTLBlendOperationAdd;
+    light.colorAttachments[0].sourceRGBBlendFactor         = MTLBlendFactorOne;
+    light.colorAttachments[0].destinationRGBBlendFactor    = MTLBlendFactorOne;
+    light.colorAttachments[0].sourceAlphaBlendFactor       = MTLBlendFactorZero;
+    light.colorAttachments[0].destinationAlphaBlendFactor  = MTLBlendFactorOne;
+    m_state->lightPipeline =
+        [m_state->device newRenderPipelineStateWithDescriptor:light error:&error];
+    if (!m_state->lightPipeline) {
+        LOG_ERROR("[Metal] Light pipeline failed: %s", [[error localizedDescription] UTF8String]);
+        return false;
+    }
+
+
+    // A 1x1 empty mask keeps the light shader valid before any walls exist.
+    SetOccluders(nullptr, 0, 0.0f, 0.0f, 1.0f, 1.0f);
     return true;
 }
 
@@ -349,6 +339,10 @@ void MetalRenderer::DrawTileMap(const TileDrawConstants& constants)
     if (!m_state || !m_state->encoder || !m_state->tileIdTex) {
         return;
     }
+    m_state->cameraX    = constants.cameraX;
+    m_state->cameraY    = constants.cameraY;
+    m_state->cameraZoom = constants.zoom;
+
     [m_state->encoder setRenderPipelineState:m_state->tilePipeline];
     [m_state->encoder setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
     [m_state->encoder setFragmentTexture:m_state->tileIdTex atIndex:0];
@@ -379,6 +373,146 @@ void MetalRenderer::DrawQuad(const Quad& quad)
                          vertexCount:4];
 }
 
+void MetalRenderer::SetOccluders(const Wall* walls, int wallCount,
+                                 float originX, float originY,
+                                 float worldWidth, float worldHeight)
+{
+    if (!m_state || !m_state->occluderPipeline) {
+        return;
+    }
+
+    m_state->maskOriginX = originX;
+    m_state->maskOriginY = originY;
+    m_state->maskWidth   = std::max(1.0f, worldWidth);
+    m_state->maskHeight  = std::max(1.0f, worldHeight);
+
+    // One mask texel per 4 world pixels, capped so huge maps stay bounded.
+    const NSUInteger texW = std::clamp<NSUInteger>(
+        static_cast<NSUInteger>(m_state->maskWidth / 4.0f), 1, 2048);
+    const NSUInteger texH = std::clamp<NSUInteger>(
+        static_cast<NSUInteger>(m_state->maskHeight / 4.0f), 1, 2048);
+
+    MTLTextureDescriptor* desc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                           width:texW
+                                                          height:texH
+                                                       mipmapped:NO];
+    desc.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModePrivate;
+
+    id<MTLTexture> mask = [m_state->device newTextureWithDescriptor:desc];
+    if (!mask) {
+        LOG_ERROR("[Metal] Occlusion mask allocation failed");
+        return;
+    }
+
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture     = mask;
+    pass.colorAttachments[0].loadAction  = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+
+    id<MTLCommandBuffer>        buffer  = [m_state->queue commandBuffer];
+    id<MTLRenderCommandEncoder> encoder = [buffer renderCommandEncoderWithDescriptor:pass];
+    [encoder setRenderPipelineState:m_state->occluderPipeline];
+
+    int drawn = 0;
+    for (int i = 0; i < wallCount; ++i) {
+        const Wall& wall = walls[i];
+        if (!wall.blocksLight) {
+            continue;
+        }
+        const float constants[8] = {
+            wall.x, wall.y, wall.w, wall.h,
+            originX, originY, m_state->maskWidth, m_state->maskHeight,
+        };
+        [encoder setVertexBytes:constants length:sizeof(constants) atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        ++drawn;
+    }
+
+    [encoder endEncoding];
+    [buffer commit];
+    [buffer waitUntilCompleted];
+
+    m_state->occlusionMask = mask;
+    LOG_INFO("[Metal] Occlusion mask rebuilt: %lux%lu texels, %d occluder(s)",
+             (unsigned long)texW, (unsigned long)texH, drawn);
+}
+
+void MetalRenderer::DrawWalls(const Wall* walls, int wallCount)
+{
+    if (!m_state || !m_state->encoder) {
+        return;
+    }
+    // Walls are ordinary quads once transformed to screen space, so they go
+    // through the existing quad path rather than a pipeline of their own.
+    for (int i = 0; i < wallCount; ++i) {
+        const Wall& wall = walls[i];
+        Quad quad;
+        quad.x = (wall.x - m_state->cameraX) * m_state->cameraZoom + m_state->viewportWidth * 0.5f;
+        quad.y = (wall.y - m_state->cameraY) * m_state->cameraZoom + m_state->viewportHeight * 0.5f;
+        quad.w = wall.w * m_state->cameraZoom;
+        quad.h = wall.h * m_state->cameraZoom;
+        quad.color = wall.color;
+        DrawQuad(quad);
+    }
+}
+
+void MetalRenderer::DrawLighting(const Light* lights, int lightCount,
+                                 const TileDrawConstants& camera)
+{
+    if (!m_state || !m_state->encoder || !m_state->occlusionMask) {
+        return;
+    }
+
+    // Visible world rectangle, used to cull lights that cannot reach the view.
+    const float halfW = camera.viewportW * 0.5f / camera.zoom;
+    const float halfH = camera.viewportH * 0.5f / camera.zoom;
+    const float viewMinX = camera.cameraX - halfW, viewMaxX = camera.cameraX + halfW;
+    const float viewMinY = camera.cameraY - halfH, viewMaxY = camera.cameraY + halfH;
+
+    [m_state->encoder setRenderPipelineState:m_state->lightPipeline];
+    [m_state->encoder setFragmentTexture:m_state->occlusionMask atIndex:0];
+
+    int drawn = 0;
+    for (int i = 0; i < lightCount; ++i) {
+        const Light& light = lights[i];
+        const float closestX = std::clamp(light.x, viewMinX, viewMaxX);
+        const float closestY = std::clamp(light.y, viewMinY, viewMaxY);
+        const float dx = light.x - closestX, dy = light.y - closestY;
+        if (dx * dx + dy * dy > light.distance * light.distance) {
+            continue;  // beam cannot reach the viewport
+        }
+
+        const float halfAngle = light.angleDeg * 0.5f * 3.14159265f / 180.0f;
+        const float constants[24] = {
+            light.color.r * light.intensity, light.color.g * light.intensity,
+            light.color.b * light.intensity, 1.0f,
+            m_state->maskOriginX, m_state->maskOriginY,
+            m_state->maskWidth, m_state->maskHeight,
+            light.x, light.y,
+            light.dirX, light.dirY,
+            light.distance,
+            std::cos(halfAngle),
+            light.softness,
+            light.mode == LightMode::ScreenSpace ? 1.0f : 0.0f,
+            camera.cameraX, camera.cameraY,
+            camera.zoom, light.pixelArt ? 1.0f : 0.0f,
+            camera.viewportW, camera.viewportH,
+            0.0f, 0.0f,
+        };
+        [m_state->encoder setFragmentBytes:constants length:sizeof(constants) atIndex:0];
+        [m_state->encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        ++drawn;
+    }
+    (void)drawn;
+
+
+    // Leave the quad pipeline bound: DrawQuad assumes it is current.
+    [m_state->encoder setRenderPipelineState:m_state->pipeline];
+}
+
 void MetalRenderer::EndFrame()
 {
     if (!m_state || !m_state->poolToken) {
@@ -388,8 +522,11 @@ void MetalRenderer::EndFrame()
     [m_state->encoder endEncoding];
 
 
+
+
     [m_state->commandBuffer presentDrawable:m_state->drawable];
     [m_state->commandBuffer commit];
+
 
     m_state->encoder        = nil;
     m_state->commandBuffer  = nil;
@@ -412,7 +549,10 @@ void MetalRenderer::Shutdown()
         SDL_Metal_DestroyView(m_state->view);
         m_state->view = nullptr;
     }
-    m_state->tilePipeline = nil;  // ARC releases
+    m_state->occluderPipeline = nil;  // ARC releases
+    m_state->lightPipeline    = nil;
+    m_state->occlusionMask    = nil;
+    m_state->tilePipeline = nil;
     m_state->tileIdTex    = nil;
     m_state->atlasTex     = nil;
     m_state->paletteTex   = nil;

@@ -1,7 +1,8 @@
 #include "renderer/dx12/D3D12Renderer.h"
 
 #include <climits>
-#include <cstring>
+#include <cmath>
+#include <cstddef>
 #include <string>
 
 #include <d3d12sdklayers.h>
@@ -12,7 +13,9 @@
 
 
 #include "core/Log.h"
+#include "core/Paths.h"
 #include "core/Window.h"
+#include "world/Environment.h"
 #include "world/TileAtlas.h"
 #include "world/TileRegistry.h"
 
@@ -22,109 +25,120 @@ namespace engine {
 
 namespace {
 
-// One quad per draw, no vertex buffers: the four corners come from SV_VertexID
-// and the root constants, which mirror QuadConstants field for field.
-constexpr char kQuadShaderSource[] = R"(
-cbuffer QuadConstants : register(b0)
-{
-    float4 rect;      // x, y, w, h in pixels
-    float4 color;     // rgba
-    float2 viewport;  // framebuffer size in pixels
-    float2 padding;
-};
-
-struct VSOutput
-{
-    float4 position : SV_Position;
-    float4 color    : COLOR0;
-};
-
-VSOutput VSMain(uint vertexId : SV_VertexID)
-{
-    float2 corner = float2(float(vertexId & 1u), float((vertexId >> 1u) & 1u));
-    float2 pixel  = rect.xy + corner * rect.zw;
-
-    VSOutput output;
-    // Pixel space is top-left origin with +Y down; D3D12 clip space is Y-up.
-    output.position = float4(pixel.x / viewport.x * 2.0 - 1.0,
-                             1.0 - pixel.y / viewport.y * 2.0,
-                             0.0,
-                             1.0);
-    output.color = color;
-    return output;
-}
-
-float4 PSMain(VSOutput input) : SV_Target
-{
-    return input.color;
-}
-)";
-
-// Fullscreen tile pass: each fragment finds the world tile it covers from the
-// camera constants, reads the tile id (t0), and resolves the final color
-// through the palette (t2) and atlas (t1). The cbuffer mirrors
-// TileDrawConstants field for field.
-constexpr char kTileShaderSource[] = R"(
-cbuffer TileConstants : register(b0)
-{
-    float2 camera;      // world pixels at the viewport center
-    float  zoom;        // screen pixels per world pixel
-    float  tileSizePx;  // world pixels per tile
-    float2 viewport;    // framebuffer size in pixels
-    float2 mapSize;     // map size in tiles
-    float4 background;  // color outside the map bounds
-    float4 padding;
-};
-
-Texture2D<uint>   tileIds    : register(t0);
-Texture2D         atlas      : register(t1);
-Texture2D<float4> palette    : register(t2);
-SamplerState      pointClamp : register(s0);
-
-struct VSOutput
-{
-    float4 position : SV_Position;
-};
-
-VSOutput VSMain(uint vertexId : SV_VertexID)
-{
-    // One triangle that covers the whole viewport.
-    const float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
-
-    VSOutput output;
-    output.position = float4(corners[vertexId], 0.0, 1.0);
-    return output;
-}
-
-float4 PSMain(VSOutput input) : SV_Target
-{
-    // SV_Position arrives as top-left-origin pixel coordinates with +Y down,
-    // which matches world space, so there are no axis flips anywhere.
-    float2 worldPx = camera + (input.position.xy - viewport * 0.5) / zoom;
-    float2 tilePos = floor(worldPx / tileSizePx);
-
-    if (any(tilePos < 0.0) || any(tilePos >= mapSize)) {
-        return background;
-    }
-
-    uint   id       = min(tileIds.Load(int3(int2(tilePos), 0)), 255u);
-    float4 colorRow = palette.Load(int3(int(id), 0, 0));  // rgb + has-texture flag
-    float4 uvRow    = palette.Load(int3(int(id), 1, 0));  // atlas UV rect
-
-    float3 result = colorRow.rgb;
-    if (colorRow.a > 0.5) {
-        float2 f  = frac(worldPx / tileSizePx);
-        float2 uv = lerp(uvRow.xy, uvRow.zw, f);
-        result = atlas.Sample(pointClamp, uv).rgb * colorRow.rgb;
-    }
-    return float4(result, 1.0);
-}
-)";
-
 // The tile cbuffer above is written against this exact size; a change to
 // TileDrawConstants must update the shader too.
 static_assert(sizeof(TileDrawConstants) == 16 * sizeof(uint32_t),
               "TileDrawConstants must stay 16 root constants");
+
+// Root constants for the occluder pass: the wall rect and the mask rect.
+struct OccluderPassConstants {
+    float rect[4];      // wall x, y, w, h in world pixels
+    float maskRect[4];  // mask origin xy, mask size zw
+};
+
+// Root constants for the light pass. LightDrawConstants (core/Scene2D.h) only
+// covers the light itself; the shader also needs the camera and the mask
+// rectangle, so both live in one block. HLSL cbuffer packing puts every field
+// at the offset the C++ layout gives it (checked by the static_asserts below).
+//
+//  DWORD  0- 1  lightPos          DWORD 12-13  camera
+//  DWORD  2- 3  lightDir          DWORD 14     zoom
+//  DWORD  4- 7  lightColor        DWORD 15     pixelArt
+//  DWORD  8     lightDistance     DWORD 16-17  viewport
+//  DWORD  9     cosHalfAngle      DWORD 18-19  pad1
+//  DWORD 10     softness          DWORD 20-23  maskRect
+//  DWORD 11     mode
+struct LightPassConstants {
+    float lightPos[2];
+    float lightDir[2];
+    float lightColor[4];
+    float lightDistance;
+    float cosHalfAngle;
+    float softness;
+    float mode;
+    float camera[2];
+    float zoom;
+    float pixelArt;
+    float viewport[2];
+    float pad1[2];
+    float maskRect[4];
+};
+
+constexpr UINT kOccluderConstantCount =
+    static_cast<UINT>(sizeof(OccluderPassConstants) / sizeof(uint32_t));
+constexpr UINT kLightConstantCount =
+    static_cast<UINT>(sizeof(LightPassConstants) / sizeof(uint32_t));
+
+// Root constants are limited to 64 DWORDs, minus one per other root parameter.
+static_assert(kOccluderConstantCount == 8, "occluder constants must stay 8 DWORDs");
+static_assert(kLightConstantCount == 24, "light constants must stay 24 DWORDs");
+static_assert(offsetof(LightPassConstants, camera) == 12 * sizeof(float),
+              "light cbuffer packing: camera must land on DWORD 12");
+static_assert(offsetof(LightPassConstants, pixelArt) == 15 * sizeof(float),
+              "light cbuffer packing: pixelArt must land on DWORD 15");
+static_assert(offsetof(LightPassConstants, maskRect) == 20 * sizeof(float),
+              "light cbuffer packing: maskRect must land on DWORD 20");
+
+constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+
+// Circle (light position and reach) against the world-space viewport rect.
+bool CircleIntersectsRect(float cx, float cy, float radius, float minX, float minY, float maxX,
+                          float maxY)
+{
+    const float nearestX = cx < minX ? minX : (cx > maxX ? maxX : cx);
+    const float nearestY = cy < minY ? minY : (cy > maxY ? maxY : cy);
+    const float dx       = cx - nearestX;
+    const float dy       = cy - nearestY;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+// Everything the occluder and light pipelines share: no depth, no input
+// layout, solid fill, no culling, one render target, no MSAA, opaque blending.
+// Callers still set pRootSignature, VS, PS, RTVFormats[0] and any blending.
+void FillFixedFunctionState(D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc)
+{
+    desc.BlendState.AlphaToCoverageEnable  = FALSE;
+    desc.BlendState.IndependentBlendEnable = FALSE;
+
+    D3D12_RENDER_TARGET_BLEND_DESC& blend = desc.BlendState.RenderTarget[0];
+    blend.BlendEnable           = FALSE;
+    blend.LogicOpEnable         = FALSE;
+    blend.SrcBlend              = D3D12_BLEND_ONE;
+    blend.DestBlend             = D3D12_BLEND_ZERO;
+    blend.BlendOp               = D3D12_BLEND_OP_ADD;
+    blend.SrcBlendAlpha         = D3D12_BLEND_ONE;
+    blend.DestBlendAlpha        = D3D12_BLEND_ZERO;
+    blend.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+    blend.LogicOp               = D3D12_LOGIC_OP_NOOP;
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    desc.SampleMask = UINT_MAX;
+
+    desc.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.FrontCounterClockwise = FALSE;
+    desc.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+    desc.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    desc.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    desc.RasterizerState.DepthClipEnable       = TRUE;
+    desc.RasterizerState.MultisampleEnable     = FALSE;
+    desc.RasterizerState.AntialiasedLineEnable = FALSE;
+    desc.RasterizerState.ForcedSampleCount     = 0;
+    desc.RasterizerState.ConservativeRaster    = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    desc.DepthStencilState.DepthEnable   = FALSE;
+    desc.DepthStencilState.StencilEnable = FALSE;
+
+    desc.InputLayout.pInputElementDescs = nullptr;
+    desc.InputLayout.NumElements        = 0;
+    desc.PrimitiveTopologyType          = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets               = 1;
+    desc.DSVFormat                      = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count               = 1;
+    desc.SampleDesc.Quality             = 0;
+    desc.NodeMask                       = 0;
+    desc.Flags                          = D3D12_PIPELINE_STATE_FLAG_NONE;
+}
 
 constexpr UINT AlignUp(UINT value, UINT alignment)
 {
@@ -147,16 +161,26 @@ std::string ToUtf8(const wchar_t* wide)
     return utf8;
 }
 
-bool CompileShader(const char* source, size_t sourceSize, const char* sourceName,
-                   const char* entryPoint, const char* target, ComPtr<ID3DBlob>& blob)
+// Loads the HLSL from shaders/hlsl/<name>.hlsl and compiles it at runtime, so
+// editing a shader only needs an app relaunch, not a rebuild.
+bool CompileShader(const char* sourceName, const char* entryPoint, const char* target,
+                   ComPtr<ID3DBlob>& blob)
 {
+    const std::string path   = ResolveDataPath(std::string("shaders/hlsl/") + sourceName);
+    const std::string source = LoadTextFile(path);
+    if (source.empty()) {
+        LOG_ERROR("[D3D12] Shader source '%s' is missing or empty", path.c_str());
+        return false;
+    }
+    const size_t sourceSize = source.size();
+
     UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifndef NDEBUG
     flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
     ComPtr<ID3DBlob> errors;
-    const HRESULT hr = D3DCompile(source, sourceSize, sourceName, nullptr, nullptr, entryPoint,
+    const HRESULT hr = D3DCompile(source.data(), sourceSize, sourceName, nullptr, nullptr, entryPoint,
                                   target, flags, 0, &blob, &errors);
     if (FAILED(hr)) {
         LOG_ERROR("[D3D12] %s %s compilation failed (0x%08X): %s", sourceName, target,
@@ -331,9 +355,11 @@ bool D3D12Renderer::CreateSwapChain(Window& window)
 bool D3D12Renderer::CreateRenderTargets()
 {
     if (!m_rtvHeap) {
+        // kFrameCount back-buffer views plus one slot (kMaskRtvIndex) for the
+        // occlusion mask. Only the back-buffer views are rewritten on resize.
         D3D12_DESCRIPTOR_HEAP_DESC desc{};
         desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        desc.NumDescriptors = kFrameCount;
+        desc.NumDescriptors = kRtvHeapSize;
         desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         desc.NodeMask       = 0;
 
@@ -398,11 +424,11 @@ bool D3D12Renderer::CreatePipelineState()
 {
     ComPtr<ID3DBlob> vertexShader;
     ComPtr<ID3DBlob> pixelShader;
-    if (!CompileShader(kQuadShaderSource, sizeof(kQuadShaderSource) - 1, "quad.hlsl", "VSMain",
+    if (!CompileShader("quad.hlsl", "VSMain",
                        "vs_5_1", vertexShader)) {
         return false;
     }
-    if (!CompileShader(kQuadShaderSource, sizeof(kQuadShaderSource) - 1, "quad.hlsl", "PSMain",
+    if (!CompileShader("quad.hlsl", "PSMain",
                        "ps_5_1", pixelShader)) {
         return false;
     }
@@ -762,6 +788,13 @@ bool D3D12Renderer::CreateSrvHeap()
     return true;
 }
 
+D3D12_CPU_DESCRIPTOR_HANDLE D3D12Renderer::RtvCpuHandle(UINT slot) const
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(m_rtvDescriptorSize);
+    return handle;
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Renderer::SrvCpuHandle(UINT slot) const
 {
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -803,6 +836,49 @@ bool D3D12Renderer::CreateTexture2D(UINT width, UINT height, DXGI_FORMAT format,
                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                  IID_PPV_ARGS(&texture)))) {
         LOG_ERROR("[D3D12] CreateCommittedResource(texture %ux%u) failed", width, height);
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateRenderTargetTexture(UINT width, UINT height, DXGI_FORMAT format,
+                                              ComPtr<ID3D12Resource>& texture)
+{
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type                 = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    heap.CreationNodeMask     = 0;
+    heap.VisibleNodeMask      = 0;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Alignment          = 0;
+    desc.Width              = width;
+    desc.Height             = height;
+    desc.DepthOrArraySize   = 1;
+    desc.MipLevels          = 1;
+    desc.Format             = format;
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    // Matches the ClearRenderTargetView the occluder pass issues, so the clear
+    // stays on the fast path and the debug layer stays quiet.
+    D3D12_CLEAR_VALUE clearValue{};
+    clearValue.Format   = format;
+    clearValue.Color[0] = 0.0f;
+    clearValue.Color[1] = 0.0f;
+    clearValue.Color[2] = 0.0f;
+    clearValue.Color[3] = 0.0f;
+
+    // Created straight in RENDER_TARGET state: the only thing that ever writes
+    // it is the occluder pass, which runs before the first read.
+    if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue,
+                                                 IID_PPV_ARGS(&texture)))) {
+        LOG_ERROR("[D3D12] CreateCommittedResource(render target %ux%u) failed", width, height);
         return false;
     }
     return true;
@@ -909,11 +985,11 @@ bool D3D12Renderer::CreateTilePipelineState()
 {
     ComPtr<ID3DBlob> vertexShader;
     ComPtr<ID3DBlob> pixelShader;
-    if (!CompileShader(kTileShaderSource, sizeof(kTileShaderSource) - 1, "tile.hlsl", "VSMain",
+    if (!CompileShader("tile.hlsl", "VSMain",
                        "vs_5_1", vertexShader)) {
         return false;
     }
-    if (!CompileShader(kTileShaderSource, sizeof(kTileShaderSource) - 1, "tile.hlsl", "PSMain",
+    if (!CompileShader("tile.hlsl", "PSMain",
                        "ps_5_1", pixelShader)) {
         return false;
     }
@@ -1298,7 +1374,14 @@ void D3D12Renderer::BindTilePipeline()
 
 void D3D12Renderer::DrawTileMap(const TileDrawConstants& constants)
 {
-    if (!m_frameActive || !m_tileResourcesReady || !m_tilePipelineState) {
+    if (!m_frameActive) {
+        return;
+    }
+    // DrawWalls receives no camera of its own; it transforms with this one.
+    m_lastCamera  = constants;
+    m_cameraValid = true;
+
+    if (!m_tileResourcesReady || !m_tilePipelineState) {
         return;
     }
     if (m_boundPipeline != BoundPipeline::Tile) {
@@ -1327,6 +1410,531 @@ void D3D12Renderer::ReleaseTileUploadBuffers()
     }
 }
 
+// --- Volumetric lighting -----------------------------------------------------
+
+bool D3D12Renderer::CreateOccluderRootSignature()
+{
+    // One block of root constants at b0 (wall rect + mask rect); the pass has
+    // no textures and no vertex buffers.
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    param.Constants.ShaderRegister = 0;
+    param.Constants.RegisterSpace  = 0;
+    param.Constants.Num32BitValues = kOccluderConstantCount;
+    param.ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters     = 1;
+    desc.pParameters       = &param;
+    desc.NumStaticSamplers = 0;
+    desc.pStaticSamplers   = nullptr;
+    desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> serialized;
+    ComPtr<ID3DBlob> errors;
+    if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized,
+                                           &errors))) {
+        LOG_ERROR("[D3D12] Occluder root signature serialization failed: %s",
+                  errors ? static_cast<const char*>(errors->GetBufferPointer())
+                         : "(no diagnostics)");
+        return false;
+    }
+
+    if (FAILED(m_device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                                             serialized->GetBufferSize(),
+                                             IID_PPV_ARGS(&m_occluderRootSignature)))) {
+        LOG_ERROR("[D3D12] Occluder CreateRootSignature failed");
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateOccluderPipelineState()
+{
+    ComPtr<ID3DBlob> vertexShader;
+    ComPtr<ID3DBlob> pixelShader;
+    if (!CompileShader("occluder.hlsl",
+                       "VSMain", "vs_5_1", vertexShader)) {
+        return false;
+    }
+    if (!CompileShader("occluder.hlsl",
+                       "PSMain", "ps_5_1", pixelShader)) {
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    FillFixedFunctionState(desc);
+    desc.pRootSignature = m_occluderRootSignature.Get();
+
+    desc.VS.pShaderBytecode = vertexShader->GetBufferPointer();
+    desc.VS.BytecodeLength  = vertexShader->GetBufferSize();
+    desc.PS.pShaderBytecode = pixelShader->GetBufferPointer();
+    desc.PS.BytecodeLength  = pixelShader->GetBufferSize();
+
+    // Overlapping walls all write 1.0, so the mask needs no blending.
+    desc.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
+
+    if (FAILED(
+            m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_occluderPipelineState)))) {
+        LOG_ERROR("[D3D12] Occluder CreateGraphicsPipelineState failed");
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateLightRootSignature()
+{
+    // Param 0: LightPassConstants as root constants at b0 (24 DWORDs; the
+    // pass reuses the block and fills only its first 16). Param 1: the
+    // occlusion mask at t0, plus a linear-clamp static sampler at s0.
+    // 24 + 1 = 25 of the 64 available root DWORDs.
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors                    = 1;
+    range.BaseShaderRegister                = 0;
+    range.RegisterSpace                     = 0;
+    range.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.ShaderRegister = 0;
+    params[0].Constants.RegisterSpace  = 0;
+    params[0].Constants.Num32BitValues = kLightConstantCount;
+    params[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges   = &range;
+    params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MipLODBias       = 0.0f;
+    sampler.MaxAnisotropy    = 1;
+    sampler.ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.BorderColor      = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    sampler.MinLOD           = 0.0f;
+    sampler.MaxLOD           = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister   = 0;
+    sampler.RegisterSpace    = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters     = 2;
+    desc.pParameters       = params;
+    desc.NumStaticSamplers = 1;
+    desc.pStaticSamplers   = &sampler;
+    desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> serialized;
+    ComPtr<ID3DBlob> errors;
+    if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized,
+                                           &errors))) {
+        LOG_ERROR("[D3D12] Light root signature serialization failed: %s",
+                  errors ? static_cast<const char*>(errors->GetBufferPointer())
+                         : "(no diagnostics)");
+        return false;
+    }
+
+    if (FAILED(m_device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                                             serialized->GetBufferSize(),
+                                             IID_PPV_ARGS(&m_lightRootSignature)))) {
+        LOG_ERROR("[D3D12] Light CreateRootSignature failed");
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateLightPipelineState()
+{
+    ComPtr<ID3DBlob> vertexShader;
+    ComPtr<ID3DBlob> pixelShader;
+    if (!CompileShader("light.hlsl", "VSMain",
+                       "vs_5_1", vertexShader)) {
+        return false;
+    }
+    if (!CompileShader("light.hlsl", "PSMain",
+                       "ps_5_1", pixelShader)) {
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    FillFixedFunctionState(desc);
+    desc.pRootSignature = m_lightRootSignature.Get();
+
+    desc.VS.pShaderBytecode = vertexShader->GetBufferPointer();
+    desc.VS.BytecodeLength  = vertexShader->GetBufferSize();
+    desc.PS.pShaderBytecode = pixelShader->GetBufferPointer();
+    desc.PS.BytecodeLength  = pixelShader->GetBufferSize();
+
+    // Lights accumulate: every light adds its contribution to what is there.
+    D3D12_RENDER_TARGET_BLEND_DESC& blend = desc.BlendState.RenderTarget[0];
+    blend.BlendEnable    = TRUE;
+    blend.SrcBlend       = D3D12_BLEND_ONE;
+    blend.DestBlend      = D3D12_BLEND_ONE;
+    blend.BlendOp        = D3D12_BLEND_OP_ADD;
+    blend.SrcBlendAlpha  = D3D12_BLEND_ONE;
+    blend.DestBlendAlpha = D3D12_BLEND_ONE;
+    blend.BlendOpAlpha   = D3D12_BLEND_OP_ADD;
+
+    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    if (FAILED(m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_lightPipelineState)))) {
+        LOG_ERROR("[D3D12] Light CreateGraphicsPipelineState failed");
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::EnsureOccluderPipeline()
+{
+    if (!m_occluderRootSignature && !CreateOccluderRootSignature()) {
+        return false;
+    }
+    if (!m_occluderPipelineState && !CreateOccluderPipelineState()) {
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::EnsureLightingPipelines()
+{
+    if (m_lightPipelineState) {
+        return true;
+    }
+    // A shader that failed to compile will fail again; do not pay for it once
+    // per frame.
+    if (m_lightingUnavailable || !m_device) {
+        return false;
+    }
+
+    if ((!m_lightRootSignature && !CreateLightRootSignature()) ||
+        (!m_lightPipelineState && !CreateLightPipelineState()) ||) {
+        LOG_ERROR("[D3D12] Lighting pipeline unavailable; light passes are disabled");
+        m_lightingUnavailable = true;
+        m_lightPipelineState.Reset();
+        m_lightRootSignature.Reset();
+        return false;
+    }
+    return true;
+}
+
+void D3D12Renderer::ReleaseOcclusionMask()
+{
+    // The RTV and SRV descriptors are left dangling on purpose: nothing binds
+    // them while m_maskReady is false, and the next successful SetOccluders
+    // overwrites both in place.
+    m_maskReady = false;
+    m_occlusionMask.Reset();
+    m_maskWidth  = 0;
+    m_maskHeight = 0;
+}
+
+void D3D12Renderer::SetOccluders(const Wall* walls, int wallCount, float originX, float originY,
+                                 float worldWidth, float worldHeight)
+{
+    if (!m_device || !m_commandQueue || !m_commandList) {
+        LOG_ERROR("[D3D12] SetOccluders called before Init");
+        return;
+    }
+    if (m_frameActive) {
+        LOG_ERROR("[D3D12] SetOccluders must not run inside a frame");
+        return;
+    }
+    if (!(worldWidth > 0.0f) || !(worldHeight > 0.0f)) {
+        LOG_ERROR("[D3D12] SetOccluders: invalid world rectangle (%.1f x %.1f)", worldWidth,
+                  worldHeight);
+        return;
+    }
+
+    // In-flight frames may still be sampling the previous mask, and the shared
+    // command list has to be idle before this can reuse it.
+    WaitForGpu();
+    ReleaseOcclusionMask();
+
+    if (!CreateSrvHeap() || !EnsureOccluderPipeline()) {
+        return;
+    }
+    // The light pipeline is built here too: this runs outside a
+    // frame, so their shader compiles never stall a recorded command list.
+    EnsureLightingPipelines();
+
+    // One texel per four world pixels, at least 1 and at most kMaskMaxTexels.
+    // The comparisons are written so a NaN extent lands on the 1-texel floor.
+    const auto resolution = [](float worldExtent) -> UINT {
+        float texels = std::ceil(worldExtent / kMaskWorldPxPerTexel);
+        if (!(texels >= 1.0f)) {
+            texels = 1.0f;
+        }
+        if (texels > static_cast<float>(kMaskMaxTexels)) {
+            texels = static_cast<float>(kMaskMaxTexels);
+        }
+        return static_cast<UINT>(texels);
+    };
+
+    const UINT maskW = resolution(worldWidth);
+    const UINT maskH = resolution(worldHeight);
+
+    if (!CreateRenderTargetTexture(maskW, maskH, DXGI_FORMAT_R8_UNORM, m_occlusionMask)) {
+        ReleaseOcclusionMask();
+        return;
+    }
+
+    // The mask RTV sits in the slot past the back buffers, so a resize (which
+    // only rewrites slots 0..kFrameCount-1) leaves it alone.
+    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
+    rtvDesc.Format               = DXGI_FORMAT_R8_UNORM;
+    rtvDesc.ViewDimension        = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtvDesc.Texture2D.MipSlice   = 0;
+    rtvDesc.Texture2D.PlaneSlice = 0;
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = RtvCpuHandle(kMaskRtvIndex);
+    m_device->CreateRenderTargetView(m_occlusionMask.Get(), &rtvDesc, rtv);
+
+    // SRV heap slot 3, right after the three tile textures.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format                        = DXGI_FORMAT_R8_UNORM;
+    srv.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MostDetailedMip     = 0;
+    srv.Texture2D.MipLevels           = 1;
+    srv.Texture2D.PlaneSlice          = 0;
+    srv.Texture2D.ResourceMinLODClamp = 0.0f;
+    m_device->CreateShaderResourceView(m_occlusionMask.Get(), &srv, SrvCpuHandle(kMaskSrvSlot));
+
+    // One-shot command list: the GPU is idle after the WaitForGpu above, so the
+    // current frame's allocator and the shared list are free to reuse.
+    if (FAILED(m_commandAllocators[m_frameIndex]->Reset()) ||
+        FAILED(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr))) {
+        LOG_ERROR("[D3D12] Occluder command list reset failed");
+        ReleaseOcclusionMask();
+        return;
+    }
+
+    D3D12_VIEWPORT viewport{};
+    viewport.TopLeftX = 0.0f;
+    viewport.TopLeftY = 0.0f;
+    viewport.Width    = static_cast<float>(maskW);
+    viewport.Height   = static_cast<float>(maskH);
+    viewport.MinDepth = D3D12_MIN_DEPTH;
+    viewport.MaxDepth = D3D12_MAX_DEPTH;
+
+    D3D12_RECT scissor{};
+    scissor.left   = 0;
+    scissor.top    = 0;
+    scissor.right  = static_cast<LONG>(maskW);
+    scissor.bottom = static_cast<LONG>(maskH);
+
+    m_commandList->RSSetViewports(1, &viewport);
+    m_commandList->RSSetScissorRects(1, &scissor);
+    m_commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+    const float unoccluded[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    m_commandList->ClearRenderTargetView(rtv, unoccluded, 0, nullptr);
+
+    int occluders = 0;
+    if (walls && wallCount > 0) {
+        m_commandList->SetGraphicsRootSignature(m_occluderRootSignature.Get());
+        m_commandList->SetPipelineState(m_occluderPipelineState.Get());
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+        OccluderPassConstants constants{};
+        constants.maskRect[0] = originX;
+        constants.maskRect[1] = originY;
+        constants.maskRect[2] = worldWidth;
+        constants.maskRect[3] = worldHeight;
+
+        for (int i = 0; i < wallCount; ++i) {
+            const Wall& wall = walls[i];
+            if (!wall.blocksLight || wall.w <= 0.0f || wall.h <= 0.0f) {
+                continue;
+            }
+            constants.rect[0] = wall.x;
+            constants.rect[1] = wall.y;
+            constants.rect[2] = wall.w;
+            constants.rect[3] = wall.h;
+
+            m_commandList->SetGraphicsRoot32BitConstants(0, kOccluderConstantCount, &constants, 0);
+            m_commandList->DrawInstanced(4, 1, 0, 0);  // triangle strip over the four corners
+            ++occluders;
+        }
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource   = m_occlusionMask.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(1, &barrier);
+
+    if (FAILED(m_commandList->Close())) {
+        LOG_ERROR("[D3D12] Occluder command list Close failed");
+        ReleaseOcclusionMask();
+        return;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();  // the mask must be finished before any frame samples it
+
+    m_maskOriginX = originX;
+    m_maskOriginY = originY;
+    m_maskWorldW  = worldWidth;
+    m_maskWorldH  = worldHeight;
+    m_maskWidth   = maskW;
+    m_maskHeight  = maskH;
+    m_maskReady   = true;
+
+    // The next BeginFrame resets the list anyway; keep the tracker honest.
+    m_boundPipeline = BoundPipeline::None;
+
+    LOG_INFO("[D3D12] Occlusion mask rebuilt: %ux%u texels over %.0fx%.0f world px, %d occluders",
+             maskW, maskH, worldWidth, worldHeight, occluders);
+}
+
+void D3D12Renderer::DrawWalls(const Wall* walls, int wallCount)
+{
+    if (!m_frameActive || !walls || wallCount <= 0 || !m_cameraValid) {
+        return;
+    }
+
+    // World -> screen happens here on the CPU, so the walls go straight through
+    // the existing quad pipeline and need no shader of their own.
+    const float zoom  = m_lastCamera.zoom > 1e-6f ? m_lastCamera.zoom : 1.0f;
+    const float halfW = static_cast<float>(m_width) * 0.5f;
+    const float halfH = static_cast<float>(m_height) * 0.5f;
+
+    for (int i = 0; i < wallCount; ++i) {
+        const Wall& wall = walls[i];
+        if (wall.w <= 0.0f || wall.h <= 0.0f) {
+            continue;
+        }
+
+        Quad quad;
+        quad.x     = (wall.x - m_lastCamera.cameraX) * zoom + halfW;
+        quad.y     = (wall.y - m_lastCamera.cameraY) * zoom + halfH;
+        quad.w     = wall.w * zoom;
+        quad.h     = wall.h * zoom;
+        quad.color = wall.color;
+
+        // Off-screen walls would rasterize to nothing; skip the root-constant
+        // upload and the draw call instead.
+        if (quad.x + quad.w < 0.0f || quad.y + quad.h < 0.0f ||
+            quad.x > static_cast<float>(m_width) || quad.y > static_cast<float>(m_height)) {
+            continue;
+        }
+        DrawQuad(quad);
+    }
+}
+
+void D3D12Renderer::BindLightPipeline()
+{
+    ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    m_commandList->SetGraphicsRootSignature(m_lightRootSignature.Get());
+    m_commandList->SetPipelineState(m_lightPipelineState.Get());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->SetGraphicsRootDescriptorTable(1, SrvGpuHandle(kMaskSrvSlot));
+    m_boundPipeline = BoundPipeline::Light;
+}
+
+void D3D12Renderer::DrawLighting(const Light* lights, int lightCount,
+                                 const TileDrawConstants& camera)
+{
+    if (!m_frameActive || !EnsureLightingPipelines()) {
+        return;
+    }
+
+    // The camera the tile pass used, so the lighting lines up with the map.
+    const float zoom  = camera.zoom > 1e-6f ? camera.zoom : 1.0f;
+    const float viewW = camera.viewportW > 0.0f ? camera.viewportW : static_cast<float>(m_width);
+    const float viewH = camera.viewportH > 0.0f ? camera.viewportH : static_cast<float>(m_height);
+
+    if (lights && lightCount > 0 && m_maskReady) {
+        // World-space rectangle the viewport covers; lights whose reach misses
+        // it never touch the screen.
+        const float halfWorldW = viewW * 0.5f / zoom;
+        const float halfWorldH = viewH * 0.5f / zoom;
+        const float minX       = camera.cameraX - halfWorldW;
+        const float maxX       = camera.cameraX + halfWorldW;
+        const float minY       = camera.cameraY - halfWorldH;
+        const float maxY       = camera.cameraY + halfWorldH;
+
+        LightPassConstants constants{};
+        constants.camera[0]   = camera.cameraX;
+        constants.camera[1]   = camera.cameraY;
+        constants.zoom        = zoom;
+        constants.viewport[0] = viewW;
+        constants.viewport[1] = viewH;
+        constants.maskRect[0] = m_maskOriginX;
+        constants.maskRect[1] = m_maskOriginY;
+        constants.maskRect[2] = m_maskWorldW;
+        constants.maskRect[3] = m_maskWorldH;
+
+        // Cones first, then the screen-space lights; both accumulate through
+        // the same additive pipeline, so the split costs nothing.
+        for (int pass = 0; pass < 2; ++pass) {
+            const LightMode wanted =
+                pass == 0 ? LightMode::VolumetricCone : LightMode::ScreenSpace;
+
+            for (int i = 0; i < lightCount; ++i) {
+                const Light& light = lights[i];
+                if (light.mode != wanted || light.distance <= 0.0f || light.intensity <= 0.0f) {
+                    continue;
+                }
+                if (!CircleIntersectsRect(light.x, light.y, light.distance, minX, minY, maxX,
+                                          maxY)) {
+                    continue;
+                }
+
+                float       dirX   = light.dirX;
+                float       dirY   = light.dirY;
+                const float dirLen = std::sqrt(dirX * dirX + dirY * dirY);
+                if (dirLen > 1e-6f) {
+                    dirX /= dirLen;
+                    dirY /= dirLen;
+                } else {
+                    dirX = 1.0f;
+                    dirY = 0.0f;
+                }
+
+                float angleDeg = light.angleDeg;
+                if (angleDeg < 0.0f)   angleDeg = 0.0f;
+                if (angleDeg > 360.0f) angleDeg = 360.0f;
+
+                float softness = light.softness;
+                if (softness < 0.0f) softness = 0.0f;
+                if (softness > 1.0f) softness = 1.0f;
+
+                constants.lightPos[0]   = light.x;
+                constants.lightPos[1]   = light.y;
+                constants.lightDir[0]   = dirX;
+                constants.lightDir[1]   = dirY;
+                constants.lightColor[0] = light.color.r * light.intensity;
+                constants.lightColor[1] = light.color.g * light.intensity;
+                constants.lightColor[2] = light.color.b * light.intensity;
+                constants.lightColor[3] = light.color.a;
+                constants.lightDistance = light.distance;
+                constants.cosHalfAngle  = std::cos(angleDeg * 0.5f * kDegToRad);
+                constants.softness      = softness;
+                constants.mode          = wanted == LightMode::ScreenSpace ? 1.0f : 0.0f;
+                constants.pixelArt      = light.pixelArt ? 1.0f : 0.0f;
+
+                if (m_boundPipeline != BoundPipeline::Light) {
+                    BindLightPipeline();
+                }
+                m_commandList->SetGraphicsRoot32BitConstants(0, kLightConstantCount, &constants, 0);
+                m_commandList->DrawInstanced(3, 1, 0, 0);  // fullscreen triangle
+            }
+        }
+    }
+}
+
 void D3D12Renderer::Shutdown()
 {
     WaitForGpu();
@@ -1336,6 +1944,17 @@ void D3D12Renderer::Shutdown()
         CloseHandle(m_fenceEvent);
         m_fenceEvent = nullptr;
     }
+
+    // Lighting first: the mask holds an RTV in the shared RTV heap and an SRV
+    // in the shared SRV heap, so it goes before either heap is dropped.
+    ReleaseOcclusionMask();
+    m_lightPipelineState.Reset();
+    m_lightRootSignature.Reset();
+    m_occluderPipelineState.Reset();
+    m_occluderRootSignature.Reset();
+    m_lightingUnavailable = false;
+    m_cameraValid         = false;
+    m_lastCamera          = TileDrawConstants{};
 
     ReleaseTileTextures();
     ReleaseTileUploadBuffers();

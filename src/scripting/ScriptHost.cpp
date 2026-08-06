@@ -1,10 +1,14 @@
 #include "scripting/ScriptHost.h"
 
+#include <algorithm>
+#include <cmath>
+
 #include <lua.hpp>
 
 #include "core/Log.h"
 #include "core/Scene2D.h"
 #include "core/Window.h"
+#include "world/Environment.h"
 #include "world/TileRegistry.h"
 #include "world/WorldConfig.h"
 
@@ -397,6 +401,157 @@ bool ScriptHost::ReadWorldConfig(WorldConfig& config, TileRegistry& registry)
     }
     LOG_INFO("World config: %dx%d pattern '%s', %u tile type(s) defined",
              config.width, config.height, config.pattern.c_str(), registry.Count());
+    return true;
+}
+
+namespace {
+
+// Reads a {x, y} pair, accepting named keys too.
+void FieldVec2(lua_State* L, int table, const char* name, float& outX, float& outY)
+{
+    lua_getfield(L, table, name);
+    if (lua_istable(L, -1)) {
+        const int vec = lua_absindex(L, -1);
+        outX = IndexNumber(L, vec, 1, outX);
+        outY = IndexNumber(L, vec, 2, outY);
+        outX = FieldNumber(L, vec, "x", outX);
+        outY = FieldNumber(L, vec, "y", outY);
+    }
+    lua_pop(L, 1);
+}
+
+void ParseWall(lua_State* L, Environment& environment, float tileSizePx, int index)
+{
+    if (!lua_istable(L, -1)) {
+        LOG_WARN("map_environment.walls[%d]: expected a table, skipping", index);
+        return;
+    }
+    const int entry = lua_absindex(L, -1);
+
+    float px = 0.0f, py = 0.0f, sx = 1.0f, sy = 1.0f;
+    FieldVec2(L, entry, "position", px, py);
+    FieldVec2(L, entry, "size", sx, sy);
+
+    Wall wall;
+    wall.x = px * tileSizePx;
+    wall.y = py * tileSizePx;
+    wall.w = sx * tileSizePx;
+    wall.h = sy * tileSizePx;
+    wall.color = Color{0.25f, 0.25f, 0.28f, 1.0f};
+    FieldColor(L, entry, "color", wall.color);
+    wall.blocksLight = FieldBool(L, entry, "blocks_light", true);
+    wall.collision   = FieldBool(L, entry, "collision", true);
+
+    if (wall.w <= 0.0f || wall.h <= 0.0f) {
+        LOG_WARN("map_environment.walls[%d]: size must be positive, skipping", index);
+        return;
+    }
+    environment.walls.push_back(wall);
+}
+
+void ParseLight(lua_State* L, Environment& environment, float tileSizePx, int index)
+{
+    if (!lua_istable(L, -1)) {
+        LOG_WARN("map_environment.lights[%d]: expected a table, skipping", index);
+        return;
+    }
+    const int entry = lua_absindex(L, -1);
+
+    float px = 0.0f, py = 0.0f, dx = 1.0f, dy = 0.0f;
+    FieldVec2(L, entry, "position", px, py);
+    FieldVec2(L, entry, "direction", dx, dy);
+
+    Light light;
+    light.x = px * tileSizePx;
+    light.y = py * tileSizePx;
+
+    const float length = std::sqrt(dx * dx + dy * dy);
+    if (length > 1e-6f) {
+        light.dirX = dx / length;
+        light.dirY = dy / length;
+    }
+
+    const std::string mode = FieldString(L, entry, "mode", "volumetric-cone");
+    if (mode == "screen-space" || mode == "screen-space-volumetric") {
+        light.mode = LightMode::ScreenSpace;
+    } else if (mode != "volumetric-cone") {
+        LOG_WARN("map_environment.lights[%d]: unknown mode '%s', using volumetric-cone",
+                 index, mode.c_str());
+    }
+
+    const std::string style = FieldString(L, entry, "style", "smooth");
+    if (style == "pixel-art" || style == "pixelated") {
+        light.pixelArt = true;
+    } else if (style != "smooth") {
+        LOG_WARN("map_environment.lights[%d]: unknown style '%s', using smooth",
+                 index, style.c_str());
+    }
+    // Boolean spelling retained as a convenient alias and explicit override.
+    light.pixelArt = FieldBool(L, entry, "pixel_art", light.pixelArt);
+
+    FieldColor(L, entry, "color", light.color);
+    light.intensity = FieldNumber(L, entry, "intensity", light.intensity);
+    light.distance  = FieldNumber(L, entry, "distance", 10.0f) * tileSizePx;
+    light.angleDeg  = FieldNumber(L, entry, "angle", light.angleDeg);
+    light.softness  = FieldNumber(L, entry, "edge_softness", light.softness);
+
+    light.intensity = std::max(0.0f, light.intensity);
+    light.distance  = std::max(1.0f, light.distance);
+    light.angleDeg  = std::clamp(light.angleDeg, 1.0f, 360.0f);
+    light.softness  = std::clamp(light.softness, 0.0f, 1.0f);
+
+    environment.lights.push_back(light);
+}
+
+} // namespace
+
+bool ScriptHost::ReadEnvironment(Environment& environment, float tileSizePx)
+{
+    if (!m_L) {
+        return false;
+    }
+
+    lua_getglobal(m_L, "map_environment");
+    if (!lua_istable(m_L, -1)) {
+        lua_pop(m_L, 1);
+        return true;  // no environment configured is a valid scene
+    }
+    const int root = lua_absindex(m_L, -1);
+
+    lua_getfield(m_L, root, "walls");
+    if (lua_istable(m_L, -1)) {
+        const lua_Integer count = luaL_len(m_L, -1);
+        for (lua_Integer i = 1; i <= count; ++i) {
+            lua_geti(m_L, -1, i);
+            ParseWall(m_L, environment, tileSizePx, static_cast<int>(i));
+            lua_pop(m_L, 1);
+        }
+    }
+    lua_pop(m_L, 1);
+
+    lua_getfield(m_L, root, "lights");
+    if (lua_istable(m_L, -1)) {
+        const lua_Integer count = luaL_len(m_L, -1);
+        for (lua_Integer i = 1; i <= count; ++i) {
+            lua_geti(m_L, -1, i);
+            ParseLight(m_L, environment, tileSizePx, static_cast<int>(i));
+            lua_pop(m_L, 1);
+        }
+    }
+    lua_pop(m_L, 1);
+
+    lua_pop(m_L, 1);  // map_environment
+
+    size_t coneCount = 0;
+    size_t pixelArtCount = 0;
+    for (const Light& light : environment.lights) {
+        coneCount += light.mode == LightMode::VolumetricCone ? 1 : 0;
+        pixelArtCount += light.pixelArt ? 1 : 0;
+    }
+    LOG_INFO("Environment: %zu wall(s), %zu light(s) (%zu cone, %zu screen-space, "
+             "%zu pixel-art)",
+             environment.walls.size(), environment.lights.size(),
+             coneCount, environment.lights.size() - coneCount, pixelArtCount);
     return true;
 }
 

@@ -8,6 +8,7 @@
 #include <stb/stb_image.h>
 
 #include "core/Log.h"
+#include "core/Paths.h"
 
 namespace engine {
 
@@ -21,7 +22,7 @@ struct LoadedImage {
 
 } // namespace
 
-TileRenderData BuildTileRenderData(TileRegistry& registry, const std::string& baseDir)
+TileRenderData BuildTileRenderData(TileRegistry& registry)
 {
     TileRenderData data;
 
@@ -32,7 +33,7 @@ TileRenderData BuildTileRenderData(TileRegistry& registry, const std::string& ba
         if (tile.texturePath.empty()) {
             continue;
         }
-        const std::string path = baseDir + tile.texturePath;
+        const std::string path = ResolveDataPath(tile.texturePath);
 
         int width = 0, height = 0, channels = 0;
         stbi_uc* pixels = stbi_load(path.c_str(), &width, &height, &channels, 4);

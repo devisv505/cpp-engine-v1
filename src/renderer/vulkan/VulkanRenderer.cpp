@@ -1,7 +1,8 @@
 #include "renderer/vulkan/VulkanRenderer.h"
 
 #include <algorithm>
-#include <cstring>
+#include <cstddef>
+#include <cmath>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@
 
 #include "core/Log.h"
 #include "core/Window.h"
+#include "world/Environment.h"
 #include "world/TileAtlas.h"
 
 namespace engine {
@@ -70,6 +72,60 @@ const char* PresentModeName(VkPresentModeKHR mode)
 
 // The tile shaders and every backend agree on this exact push-constant size.
 static_assert(sizeof(TileDrawConstants) == 64, "TileDrawConstants must stay 64 bytes");
+
+// --- Volumetric lighting ----------------------------------------------------
+
+constexpr VkFormat kMaskFormat = VK_FORMAT_R8_UNORM;  // mandatory as a color attachment
+
+// One mask texel per 4x4 world pixels, capped well below the 4096 every
+// implementation must support for both image and framebuffer dimensions.
+constexpr float    kMaskWorldPxPerTexel = 4.0f;
+constexpr uint32_t kMaskMaxSize         = 2048;
+
+constexpr float kPi = 3.14159265358979323846f;
+
+// occluder.vert's block: the wall and the mask's world rectangle, both in world
+// pixels. Vertex stage only.
+struct OccluderPushConstants {
+    float rect[4];      // wall x, y, w, h
+    float maskRect[4];  // mask origin x, y and size w, h
+};
+static_assert(sizeof(OccluderPushConstants) == 32, "occluder.vert expects a 32-byte block");
+
+// light.frag's block. engine::LightDrawConstants carries no camera, so the
+// light fields and the camera/mask fields are packed together here; the fields
+// are copied one by one, which keeps this independent of LightDrawConstants'
+// own padding. Every member is a float or a float pair at an 8-byte aligned
+// offset, so the C++ layout and the shader's std430 block agree.
+//
+//    0  vec2  position       48  vec2  camera
+//    8  vec2  direction      56  float zoom
+//   16  vec4  color          60  float pixelArt
+//   32  float range          64  vec2  viewport
+//   36  float cosHalfAngle   72  vec2  maskOrigin
+//   40  float softness       80  vec2  maskSize
+//   44  float mode           88  vec2  pad1
+struct LightPushConstants {
+    float positionX, positionY;
+    float dirX, dirY;
+    float color[4];
+    float range;
+    float cosHalfAngle;
+    float softness;
+    float mode;
+    float cameraX, cameraY;
+    float zoom;
+    float pixelArt;
+    float viewportW, viewportH;
+    float maskOriginX, maskOriginY;
+    float maskSizeX, maskSizeY;
+    float pad1[2];
+};
+// 96 bytes: inside the 128 every Vulkan implementation guarantees, which is the
+// only push-constant budget the engine ever assumes.
+static_assert(sizeof(LightPushConstants) == 96, "light.frag expects a 96-byte block");
+static_assert(offsetof(LightPushConstants, pixelArt) == 60,
+              "light.frag expects pixelArt at byte 60");
 
 // Single-mip, single-layer color barrier; the caller picks the pipeline stages.
 VkImageMemoryBarrier MakeImageBarrier(VkImage image, VkImageLayout oldLayout,
@@ -885,8 +941,9 @@ bool VulkanRenderer::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags pro
     return false;
 }
 
-bool VulkanRenderer::CreateTileImage(VkFormat format, uint32_t width, uint32_t height,
-                                     VkImage& image, VkDeviceMemory& memory, VkImageView& view)
+bool VulkanRenderer::CreateSampledImage(VkFormat format, uint32_t width, uint32_t height,
+                                        VkImageUsageFlags usage, VkImage& image,
+                                        VkDeviceMemory& memory, VkImageView& view)
 {
     VkImageCreateInfo imageInfo{};
     imageInfo.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -897,13 +954,13 @@ bool VulkanRenderer::CreateTileImage(VkFormat format, uint32_t width, uint32_t h
     imageInfo.arrayLayers   = 1;
     imageInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.usage         = usage;
     imageInfo.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkResult result = vkCreateImage(m_device, &imageInfo, nullptr, &image);
     if (result != VK_SUCCESS) {
-        LOG_ERROR("[Vulkan] vkCreateImage failed for a %ux%u tile image (VkResult %d)",
+        LOG_ERROR("[Vulkan] vkCreateImage failed for a %ux%u image (VkResult %d)",
                   width, height, static_cast<int>(result));
         image = VK_NULL_HANDLE;
         return false;
@@ -925,7 +982,7 @@ bool VulkanRenderer::CreateTileImage(VkFormat format, uint32_t width, uint32_t h
 
     result = vkAllocateMemory(m_device, &allocInfo, nullptr, &memory);
     if (result != VK_SUCCESS) {
-        LOG_ERROR("[Vulkan] vkAllocateMemory failed for a tile image (VkResult %d)",
+        LOG_ERROR("[Vulkan] vkAllocateMemory failed for an image (VkResult %d)",
                   static_cast<int>(result));
         memory = VK_NULL_HANDLE;
         return false;
@@ -949,7 +1006,7 @@ bool VulkanRenderer::CreateTileImage(VkFormat format, uint32_t width, uint32_t h
 
     result = vkCreateImageView(m_device, &viewInfo, nullptr, &view);
     if (result != VK_SUCCESS) {
-        LOG_ERROR("[Vulkan] vkCreateImageView failed for a tile image (VkResult %d)",
+        LOG_ERROR("[Vulkan] vkCreateImageView failed for an image (VkResult %d)",
                   static_cast<int>(result));
         view = VK_NULL_HANDLE;
         return false;
@@ -1256,13 +1313,15 @@ bool VulkanRenderer::CreateTileResources(const TileRenderData& data, int mapWidt
 
     const uint32_t mapW = static_cast<uint32_t>(mapWidth);
     const uint32_t mapH = static_cast<uint32_t>(mapHeight);
-    if (!CreateTileImage(VK_FORMAT_R16_UINT, mapW, mapH,
-                         m_tileIdImage, m_tileIdMemory, m_tileIdView) ||
-        !CreateTileImage(VK_FORMAT_R8G8B8A8_UNORM, static_cast<uint32_t>(data.atlasWidth),
-                         static_cast<uint32_t>(data.atlasHeight),
-                         m_atlasImage, m_atlasMemory, m_atlasView) ||
-        !CreateTileImage(VK_FORMAT_R32G32B32A32_SFLOAT, TileRegistry::kMaxTileTypes, 2,
-                         m_paletteImage, m_paletteMemory, m_paletteView)) {
+    const VkImageUsageFlags uploaded =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!CreateSampledImage(VK_FORMAT_R16_UINT, mapW, mapH, uploaded,
+                            m_tileIdImage, m_tileIdMemory, m_tileIdView) ||
+        !CreateSampledImage(VK_FORMAT_R8G8B8A8_UNORM, static_cast<uint32_t>(data.atlasWidth),
+                            static_cast<uint32_t>(data.atlasHeight), uploaded,
+                            m_atlasImage, m_atlasMemory, m_atlasView) ||
+        !CreateSampledImage(VK_FORMAT_R32G32B32A32_SFLOAT, TileRegistry::kMaxTileTypes, 2,
+                            uploaded, m_paletteImage, m_paletteMemory, m_paletteView)) {
         DestroyTileImages();
         return false;
     }
@@ -1516,6 +1575,10 @@ void VulkanRenderer::FlushPendingTileUpload(VkCommandBuffer commandBuffer)
 
 void VulkanRenderer::DrawTileMap(const TileDrawConstants& constants)
 {
+    // Remembered before any early-out: DrawWalls has no camera parameter and
+    // uses this one even in a frame where the tile pass itself was skipped.
+    m_cameraConstants = constants;
+
     if (!m_frameActive || !m_tileResourcesReady || m_tilePipeline == VK_NULL_HANDLE) {
         return;
     }
@@ -1575,6 +1638,688 @@ void VulkanRenderer::DestroyTileImages()
     m_tileMapHeight      = 0;
     m_tileResourcesReady = false;
     m_tileUploadPending  = false;
+}
+
+// --- Volumetric lighting ----------------------------------------------------
+
+bool VulkanRenderer::CreateVertexlessPipeline(const char* vertexPath, const char* fragmentPath,
+                                              VkPrimitiveTopology topology,
+                                              const VkPipelineColorBlendAttachmentState& blend,
+                                              VkPipelineLayout layout, VkRenderPass renderPass,
+                                              VkPipeline& pipeline)
+{
+    VkShaderModule vertexModule   = LoadShaderModule(vertexPath);
+    VkShaderModule fragmentModule = LoadShaderModule(fragmentPath);
+    if (vertexModule == VK_NULL_HANDLE || fragmentModule == VK_NULL_HANDLE) {
+        if (vertexModule != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(m_device, vertexModule, nullptr);
+        }
+        if (fragmentModule != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(m_device, fragmentModule, nullptr);
+        }
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertexModule;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragmentModule;
+    stages[1].pName  = "main";
+
+    // No bindings and no attributes: every one of these shaders builds its
+    // corners from gl_VertexIndex and the push constants.
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = topology;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount  = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.depthClampEnable        = VK_FALSE;
+    raster.rasterizerDiscardEnable = VK_FALSE;
+    raster.polygonMode             = VK_POLYGON_MODE_FILL;
+    raster.cullMode                = VK_CULL_MODE_NONE;
+    raster.frontFace               = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.depthBiasEnable         = VK_FALSE;
+    raster.lineWidth               = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisample.sampleShadingEnable  = VK_FALSE;
+    multisample.minSampleShading     = 1.0f;
+
+    VkPipelineColorBlendStateCreateInfo colorBlend{};
+    colorBlend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.logicOpEnable   = VK_FALSE;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments    = &blend;
+
+    const VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates    = dynamicStates;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount          = 2;
+    pipelineInfo.pStages             = stages;
+    pipelineInfo.pVertexInputState   = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState      = &viewportState;
+    pipelineInfo.pRasterizationState = &raster;
+    pipelineInfo.pMultisampleState   = &multisample;
+    pipelineInfo.pDepthStencilState  = nullptr;  // no subpass here has depth
+    pipelineInfo.pColorBlendState    = &colorBlend;
+    pipelineInfo.pDynamicState       = &dynamicState;
+    pipelineInfo.layout              = layout;
+    pipelineInfo.renderPass          = renderPass;
+    pipelineInfo.subpass             = 0;
+    pipelineInfo.basePipelineHandle  = VK_NULL_HANDLE;
+    pipelineInfo.basePipelineIndex   = -1;
+
+    const VkResult result = vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo,
+                                                      nullptr, &pipeline);
+
+    // The modules are only needed while the pipeline is being compiled.
+    vkDestroyShaderModule(m_device, vertexModule, nullptr);
+    vkDestroyShaderModule(m_device, fragmentModule, nullptr);
+
+    if (result != VK_SUCCESS) {
+        LOG_ERROR("[Vulkan] vkCreateGraphicsPipelines failed for %s (VkResult %d)", fragmentPath,
+                  static_cast<int>(result));
+        pipeline = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+bool VulkanRenderer::CreateLightingPipelineObjects()
+{
+    // Cached across occluder rebuilds: only the mask image changes. Each step
+    // checks its own handle so a partial earlier failure resumes cleanly, and
+    // the light pipeline is built last so this early-out means "all of it".
+    if (m_lightPipeline != VK_NULL_HANDLE) {
+        return true;
+    }
+
+    if (m_maskRenderPass == VK_NULL_HANDLE) {
+        // Its own single-subpass pass: the mask is an offscreen R8 target with
+        // a resolution and lifetime unrelated to the swapchain.
+        VkAttachmentDescription color{};
+        color.format         = kMaskFormat;
+        color.samples        = VK_SAMPLE_COUNT_1_BIT;
+        color.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;  // 0 everywhere = unoccluded
+        color.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+        color.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;  // cleared every rebuild anyway
+        // The pass itself leaves the mask sampleable, so rasterizing occluders
+        // needs no explicit barrier afterwards.
+        color.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkAttachmentReference colorRef{};
+        colorRef.attachment = 0;
+        colorRef.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments    = &colorRef;
+
+        // Makes the wall writes (and the transition to SHADER_READ_ONLY) visible
+        // to the fragment shaders of every later frame that samples the mask.
+        VkSubpassDependency dependency{};
+        dependency.srcSubpass    = 0;
+        dependency.dstSubpass    = VK_SUBPASS_EXTERNAL;
+        dependency.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependency.dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dependency.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        VkRenderPassCreateInfo createInfo{};
+        createInfo.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        createInfo.attachmentCount = 1;
+        createInfo.pAttachments    = &color;
+        createInfo.subpassCount    = 1;
+        createInfo.pSubpasses      = &subpass;
+        createInfo.dependencyCount = 1;
+        createInfo.pDependencies   = &dependency;
+
+        if (vkCreateRenderPass(m_device, &createInfo, nullptr, &m_maskRenderPass) != VK_SUCCESS) {
+            LOG_ERROR("[Vulkan] vkCreateRenderPass failed for the occlusion mask");
+            m_maskRenderPass = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    if (m_occluderPipelineLayout == VK_NULL_HANDLE) {
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;  // occluder.frag is a constant
+        pushRange.offset     = 0;
+        pushRange.size       = sizeof(OccluderPushConstants);
+
+        VkPipelineLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges    = &pushRange;
+
+        if (vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &m_occluderPipelineLayout) !=
+            VK_SUCCESS) {
+            LOG_ERROR("[Vulkan] vkCreatePipelineLayout failed for the occluder pipeline");
+            m_occluderPipelineLayout = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    if (m_occluderPipeline == VK_NULL_HANDLE) {
+        // Walls are solid: the mask records "blocked", never "partly blocked".
+        VkPipelineColorBlendAttachmentState opaque{};
+        opaque.blendEnable    = VK_FALSE;
+        opaque.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+        if (!CreateVertexlessPipeline("shaders/occluder.vert.spv", "shaders/occluder.frag.spv",
+                                      VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, opaque,
+                                      m_occluderPipelineLayout, m_maskRenderPass,
+                                      m_occluderPipeline)) {
+            return false;
+        }
+    }
+
+    if (m_lightSampler == VK_NULL_HANDLE) {
+        // Linear + clamp: the mask is deliberately coarse (4 world px per
+        // texel), so filtering is what keeps shadow edges from looking blocky,
+        // and clamping makes a march that leaves the world read the border
+        // value instead of wrapping to the far side.
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType         = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter     = VK_FILTER_LINEAR;
+        samplerInfo.minFilter     = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode    = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.maxAnisotropy = 1.0f;
+
+        if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_lightSampler) != VK_SUCCESS) {
+            LOG_ERROR("[Vulkan] vkCreateSampler failed for the light sampler");
+            m_lightSampler = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    if (m_lightSetLayout == VK_NULL_HANDLE) {
+        // 0 = the occlusion mask, sampled by light.frag. The layout also backs
+        // layout but never reads it.
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding         = 0;
+        binding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1;
+        binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings    = &binding;
+
+        if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_lightSetLayout) !=
+            VK_SUCCESS) {
+            LOG_ERROR("[Vulkan] vkCreateDescriptorSetLayout failed for the light set layout");
+            m_lightSetLayout = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    if (m_lightDescriptorPool == VK_NULL_HANDLE) {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount = 1;
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets       = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes    = &poolSize;
+
+        if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_lightDescriptorPool) !=
+            VK_SUCCESS) {
+            LOG_ERROR("[Vulkan] vkCreateDescriptorPool failed for the light pool");
+            m_lightDescriptorPool = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    if (m_lightDescriptorSet == VK_NULL_HANDLE) {
+        // Allocated once and re-pointed at the new mask with
+        // vkUpdateDescriptorSets on every rebuild (the device is idle then).
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool     = m_lightDescriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts        = &m_lightSetLayout;
+
+        if (vkAllocateDescriptorSets(m_device, &allocInfo, &m_lightDescriptorSet) != VK_SUCCESS) {
+            LOG_ERROR("[Vulkan] vkAllocateDescriptorSets failed for the light set");
+            m_lightDescriptorSet = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    if (m_lightPipelineLayout == VK_NULL_HANDLE) {
+        // Only the fragment stage reads the push block.
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushRange.offset     = 0;
+        pushRange.size       = sizeof(LightPushConstants);
+
+        VkPipelineLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.setLayoutCount         = 1;
+        layoutInfo.pSetLayouts            = &m_lightSetLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges    = &pushRange;
+
+        if (vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &m_lightPipelineLayout) !=
+            VK_SUCCESS) {
+            LOG_ERROR("[Vulkan] vkCreatePipelineLayout failed for the light pipeline");
+            m_lightPipelineLayout = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    if (m_lightPipeline == VK_NULL_HANDLE) {
+        // Additive: each light only ever brightens what is already there.
+        // Destination alpha is left alone so the presented image stays opaque.
+        VkPipelineColorBlendAttachmentState additive{};
+        additive.blendEnable         = VK_TRUE;
+        additive.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        additive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        additive.colorBlendOp        = VK_BLEND_OP_ADD;
+        additive.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        additive.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        additive.alphaBlendOp        = VK_BLEND_OP_ADD;
+        additive.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+        if (!CreateVertexlessPipeline("shaders/light.vert.spv", "shaders/light.frag.spv",
+                                      VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, additive,
+                                      m_lightPipelineLayout, m_renderPass, m_lightPipeline)) {
+            return false;
+        }
+    }
+
+
+    LOG_INFO("[Vulkan] Lighting pipelines created");
+    return true;
+}
+
+bool VulkanRenderer::CreateOcclusionMask(uint32_t width, uint32_t height)
+{
+    if (!CreateSampledImage(kMaskFormat, width, height,
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            m_maskImage, m_maskMemory, m_maskView)) {
+        return false;
+    }
+
+    VkFramebufferCreateInfo createInfo{};
+    createInfo.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    createInfo.renderPass      = m_maskRenderPass;
+    createInfo.attachmentCount = 1;
+    createInfo.pAttachments    = &m_maskView;
+    createInfo.width           = width;
+    createInfo.height          = height;
+    createInfo.layers          = 1;
+
+    const VkResult result =
+        vkCreateFramebuffer(m_device, &createInfo, nullptr, &m_maskFramebuffer);
+    if (result != VK_SUCCESS) {
+        LOG_ERROR("[Vulkan] vkCreateFramebuffer failed for the occlusion mask (VkResult %d)",
+                  static_cast<int>(result));
+        m_maskFramebuffer = VK_NULL_HANDLE;
+        return false;
+    }
+
+    m_maskWidth  = width;
+    m_maskHeight = height;
+    return true;
+}
+
+bool VulkanRenderer::RasterizeOccluders(const Wall* walls, int wallCount)
+{
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool        = m_commandPool;
+    allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(m_device, &allocInfo, &commandBuffer) != VK_SUCCESS) {
+        LOG_ERROR("[Vulkan] vkAllocateCommandBuffers failed for the occluder pass");
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        LOG_ERROR("[Vulkan] vkBeginCommandBuffer failed for the occluder pass");
+        vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
+        return false;
+    }
+
+    VkClearValue clear{};  // all zero: nothing blocks light until a wall is drawn
+
+    VkRenderPassBeginInfo passInfo{};
+    passInfo.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    passInfo.renderPass        = m_maskRenderPass;
+    passInfo.framebuffer       = m_maskFramebuffer;
+    passInfo.renderArea.offset = {0, 0};
+    passInfo.renderArea.extent = {m_maskWidth, m_maskHeight};
+    passInfo.clearValueCount   = 1;
+    passInfo.pClearValues      = &clear;
+    vkCmdBeginRenderPass(commandBuffer, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_occluderPipeline);
+
+    VkViewport viewport{};
+    viewport.x        = 0.0f;
+    viewport.y        = 0.0f;
+    viewport.width    = static_cast<float>(m_maskWidth);
+    viewport.height   = static_cast<float>(m_maskHeight);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {m_maskWidth, m_maskHeight};
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    OccluderPushConstants constants{};
+    constants.maskRect[0] = m_maskOriginX;
+    constants.maskRect[1] = m_maskOriginY;
+    constants.maskRect[2] = m_maskWorldW;
+    constants.maskRect[3] = m_maskWorldH;
+
+    int drawn = 0;
+    for (int i = 0; i < wallCount; ++i) {
+        const Wall& wall = walls[i];
+        if (!wall.blocksLight || wall.w <= 0.0f || wall.h <= 0.0f) {
+            continue;
+        }
+        constants.rect[0] = wall.x;
+        constants.rect[1] = wall.y;
+        constants.rect[2] = wall.w;
+        constants.rect[3] = wall.h;
+        vkCmdPushConstants(commandBuffer, m_occluderPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(OccluderPushConstants), &constants);
+        vkCmdDraw(commandBuffer, 4, 1, 0, 0);
+        ++drawn;
+    }
+
+    vkCmdEndRenderPass(commandBuffer);
+
+    bool submitted = vkEndCommandBuffer(commandBuffer) == VK_SUCCESS;
+    if (submitted) {
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers    = &commandBuffer;
+        submitted = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) == VK_SUCCESS;
+        if (submitted) {
+            vkQueueWaitIdle(m_graphicsQueue);  // the mask is sampled from the next frame on
+        }
+    }
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &commandBuffer);
+
+    if (!submitted) {
+        LOG_ERROR("[Vulkan] Occluder pass submission failed");
+        return false;
+    }
+    LOG_INFO("[Vulkan] Occlusion mask built (%ux%u texels, world %.0fx%.0f at %.0f,%.0f, "
+             "%d occluder(s))",
+             m_maskWidth, m_maskHeight, m_maskWorldW, m_maskWorldH, m_maskOriginX, m_maskOriginY,
+             drawn);
+    return true;
+}
+
+void VulkanRenderer::SetOccluders(const Wall* walls, int wallCount, float originX, float originY,
+                                  float worldWidth, float worldHeight)
+{
+    // The light pipeline hangs off the swapchain render pass and the
+    // occluder pass records on the shared command pool, so both have to exist.
+    if (m_device == VK_NULL_HANDLE || m_renderPass == VK_NULL_HANDLE ||
+        m_commandPool == VK_NULL_HANDLE) {
+        return;
+    }
+    if (walls == nullptr || wallCount < 0) {
+        wallCount = 0;
+    }
+
+    // In-flight frames may still be sampling the previous mask.
+    vkDeviceWaitIdle(m_device);
+    DestroyOcclusionMask();
+
+    if (!CreateLightingPipelineObjects()) {
+        return;  // m_maskReady stays false, so DrawLighting keeps quiet
+    }
+
+    // A degenerate world still gets a real, cleared mask: the light shader
+    // always has something to sample, and the divisor is never zero.
+    m_maskOriginX = originX;
+    m_maskOriginY = originY;
+    m_maskWorldW  = std::max(worldWidth, 1.0f);
+    m_maskWorldH  = std::max(worldHeight, 1.0f);
+
+    const auto resolution = [](float worldSize) {
+        const float texels = worldSize / kMaskWorldPxPerTexel;
+        return static_cast<uint32_t>(
+            std::clamp(texels, 1.0f, static_cast<float>(kMaskMaxSize)));
+    };
+
+    if (!CreateOcclusionMask(resolution(m_maskWorldW), resolution(m_maskWorldH)) ||
+        !RasterizeOccluders(walls, wallCount)) {
+        DestroyOcclusionMask();
+        return;
+    }
+
+    // Point the cached descriptor set at the new mask. Safe: the device was
+    // waited on above and the occluder pass drained the queue.
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.sampler     = m_lightSampler;
+    imageInfo.imageView   = m_maskView;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet          = m_lightDescriptorSet;
+    write.dstBinding      = 0;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo      = &imageInfo;
+    vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+
+    m_maskReady = true;
+}
+
+void VulkanRenderer::DrawWalls(const Wall* walls, int wallCount)
+{
+    if (!m_frameActive || walls == nullptr || wallCount <= 0) {
+        return;
+    }
+
+    // Walls are plain colored rectangles, so they reuse the quad pipeline: the
+    // only extra work is world -> screen on the CPU, with the camera the last
+    // DrawTileMap supplied (zoom 0 means none ever did).
+    const float zoom  = m_cameraConstants.zoom > 0.0f ? m_cameraConstants.zoom : 1.0f;
+    const float halfW = static_cast<float>(m_extent.width) * 0.5f;
+    const float halfH = static_cast<float>(m_extent.height) * 0.5f;
+
+    VkCommandBuffer commandBuffer = m_commandBuffers[m_frameIndex];
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+
+    for (int i = 0; i < wallCount; ++i) {
+        const Wall& wall = walls[i];
+
+        Quad quad{};
+        quad.x     = (wall.x - m_cameraConstants.cameraX) * zoom + halfW;
+        quad.y     = (wall.y - m_cameraConstants.cameraY) * zoom + halfH;
+        quad.w     = wall.w * zoom;
+        quad.h     = wall.h * zoom;
+        quad.color = wall.color;
+
+        if (quad.w <= 0.0f || quad.h <= 0.0f || quad.x + quad.w <= 0.0f ||
+            quad.y + quad.h <= 0.0f || quad.x >= halfW * 2.0f || quad.y >= halfH * 2.0f) {
+            continue;  // fully offscreen
+        }
+        DrawQuad(quad);
+    }
+}
+
+void VulkanRenderer::DrawLighting(const Light* lights, int lightCount,
+                                  const TileDrawConstants& camera)
+{
+    // Without a mask there is nothing to raymarch against and no descriptor to
+    // bind, so the whole pass waits for the first SetOccluders call.
+    if (!m_frameActive || !m_maskReady || m_lightPipeline == VK_NULL_HANDLE) {
+        return;
+    }
+    if (lights == nullptr) {
+        lightCount = 0;
+    }
+
+    const float zoom      = camera.zoom > 0.0f ? camera.zoom : 1.0f;
+    const float viewportW = static_cast<float>(m_extent.width);
+    const float viewportH = static_cast<float>(m_extent.height);
+
+    VkCommandBuffer commandBuffer = m_commandBuffers[m_frameIndex];
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_lightPipelineLayout,
+                            0, 1, &m_lightDescriptorSet, 0, nullptr);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_lightPipeline);
+
+    // The visible world rectangle, used to cull lights whose reach never
+    // touches the screen.
+    const float halfViewW = viewportW * 0.5f / zoom;
+    const float halfViewH = viewportH * 0.5f / zoom;
+    const float minX      = camera.cameraX - halfViewW;
+    const float maxX      = camera.cameraX + halfViewW;
+    const float minY      = camera.cameraY - halfViewH;
+    const float maxY      = camera.cameraY + halfViewH;
+
+    LightPushConstants constants{};
+    constants.cameraX     = camera.cameraX;
+    constants.cameraY     = camera.cameraY;
+    constants.zoom        = zoom;
+    constants.viewportW   = viewportW;
+    constants.viewportH   = viewportH;
+    constants.maskOriginX = m_maskOriginX;
+    constants.maskOriginY = m_maskOriginY;
+    constants.maskSizeX   = m_maskWorldW;
+    constants.maskSizeY   = m_maskWorldH;
+
+    // Cones first, then the screen-space lights: both use the same additive
+    // pipeline, and `mode` picks the branch inside light.frag.
+    for (int pass = 0; pass < 2; ++pass) {
+        const LightMode wanted =
+            pass == 0 ? LightMode::VolumetricCone : LightMode::ScreenSpace;
+
+        for (int i = 0; i < lightCount; ++i) {
+            const Light& light = lights[i];
+            if (light.mode != wanted || light.distance <= 0.0f || light.intensity <= 0.0f) {
+                continue;
+            }
+
+            // Circle (position, distance) against the viewport rectangle.
+            const float nearestX = std::clamp(light.x, minX, maxX);
+            const float nearestY = std::clamp(light.y, minY, maxY);
+            const float dx       = light.x - nearestX;
+            const float dy       = light.y - nearestY;
+            if (dx * dx + dy * dy > light.distance * light.distance) {
+                continue;
+            }
+
+            float dirX = light.dirX;
+            float dirY = light.dirY;
+            const float dirLength = std::sqrt(dirX * dirX + dirY * dirY);
+            if (dirLength > 1e-4f) {
+                dirX /= dirLength;
+                dirY /= dirLength;
+            } else {
+                dirX = 1.0f;  // a zero direction would collapse the cone test
+                dirY = 0.0f;
+            }
+
+            constants.positionX = light.x;
+            constants.positionY = light.y;
+            constants.dirX      = dirX;
+            constants.dirY      = dirY;
+            constants.color[0]  = light.color.r * light.intensity;
+            constants.color[1]  = light.color.g * light.intensity;
+            constants.color[2]  = light.color.b * light.intensity;
+            constants.color[3]  = light.color.a;
+            constants.range     = light.distance;
+            // angleDeg is the full cone angle, so the shader's half-angle
+            // cosine comes from half of it; 360 degrees gives -1, i.e. no cone.
+            constants.cosHalfAngle =
+                std::cos(std::clamp(light.angleDeg, 0.0f, 360.0f) * 0.5f * kPi / 180.0f);
+            constants.softness = std::clamp(light.softness, 0.0f, 1.0f);
+            constants.mode     = pass == 0 ? 0.0f : 1.0f;
+            constants.pixelArt = light.pixelArt ? 1.0f : 0.0f;
+
+            vkCmdPushConstants(commandBuffer, m_lightPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(LightPushConstants), &constants);
+            vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        }
+    }
+
+
+    // BeginFrame bound the quad pipeline; restore it so DrawQuad keeps working
+    // after the lighting passes without knowing they ran.
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+}
+
+void VulkanRenderer::DestroyOcclusionMask()
+{
+    if (m_device == VK_NULL_HANDLE) {
+        return;
+    }
+
+    // Framebuffer first: it references the view, which references the image.
+    if (m_maskFramebuffer != VK_NULL_HANDLE) {
+        vkDestroyFramebuffer(m_device, m_maskFramebuffer, nullptr);
+        m_maskFramebuffer = VK_NULL_HANDLE;
+    }
+    if (m_maskView != VK_NULL_HANDLE) {
+        vkDestroyImageView(m_device, m_maskView, nullptr);
+        m_maskView = VK_NULL_HANDLE;
+    }
+    if (m_maskImage != VK_NULL_HANDLE) {
+        vkDestroyImage(m_device, m_maskImage, nullptr);
+        m_maskImage = VK_NULL_HANDLE;
+    }
+    if (m_maskMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(m_device, m_maskMemory, nullptr);
+        m_maskMemory = VK_NULL_HANDLE;
+    }
+
+    m_maskWidth  = 0;
+    m_maskHeight = 0;
+    m_maskReady  = false;
 }
 
 void VulkanRenderer::OnResize(int pixelWidth, int pixelHeight)
@@ -1702,6 +2447,42 @@ void VulkanRenderer::Shutdown()
             m_tileSampler = VK_NULL_HANDLE;
         }
 
+        DestroyOcclusionMask();  // its framebuffer references the mask render pass
+
+        if (m_lightPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(m_device, m_lightPipeline, nullptr);
+            m_lightPipeline = VK_NULL_HANDLE;
+        }
+        if (m_lightPipelineLayout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(m_device, m_lightPipelineLayout, nullptr);
+            m_lightPipelineLayout = VK_NULL_HANDLE;
+        }
+        if (m_lightDescriptorPool != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(m_device, m_lightDescriptorPool, nullptr);  // frees the set
+            m_lightDescriptorPool = VK_NULL_HANDLE;
+            m_lightDescriptorSet  = VK_NULL_HANDLE;
+        }
+        if (m_lightSetLayout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(m_device, m_lightSetLayout, nullptr);
+            m_lightSetLayout = VK_NULL_HANDLE;
+        }
+        if (m_lightSampler != VK_NULL_HANDLE) {
+            vkDestroySampler(m_device, m_lightSampler, nullptr);
+            m_lightSampler = VK_NULL_HANDLE;
+        }
+        if (m_occluderPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(m_device, m_occluderPipeline, nullptr);
+            m_occluderPipeline = VK_NULL_HANDLE;
+        }
+        if (m_occluderPipelineLayout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(m_device, m_occluderPipelineLayout, nullptr);
+            m_occluderPipelineLayout = VK_NULL_HANDLE;
+        }
+        if (m_maskRenderPass != VK_NULL_HANDLE) {
+            vkDestroyRenderPass(m_device, m_maskRenderPass, nullptr);
+            m_maskRenderPass = VK_NULL_HANDLE;
+        }
+
         DestroySwapchainObjects();  // framebuffers reference the render pass
 
         if (m_renderPass != VK_NULL_HANDLE) {
@@ -1730,6 +2511,11 @@ void VulkanRenderer::Shutdown()
     m_imageIndex      = 0;
     m_frameActive     = false;
     m_needsRecreate   = false;
+    m_cameraConstants = TileDrawConstants{};
+    m_maskOriginX     = 0.0f;
+    m_maskOriginY     = 0.0f;
+    m_maskWorldW      = 1.0f;
+    m_maskWorldH      = 1.0f;
 }
 
 } // namespace engine

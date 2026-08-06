@@ -1,10 +1,13 @@
 #include "core/Application.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cmath>
 
 #include <SDL3/SDL.h>
 
 #include "core/Log.h"
+#include "core/Paths.h"
 #include "renderer/RendererFactory.h"
 #include "world/MapPatterns.h"
 #include "world/TileAtlas.h"
@@ -13,14 +16,27 @@ namespace engine {
 
 namespace {
 
-// Runtime data sits next to the executable (CMake copies it there), so the app
-// finds it no matter which directory it is launched from.
-std::string BaseDir()
+// Three columns by five rows, row-major. Only the glyphs used by the FPS HUD
+// are included so the overlay stays independent of a font asset or text API.
+const char* FpsGlyph(char character)
 {
-    if (const char* basePath = SDL_GetBasePath()) {
-        return basePath;
+    switch (character) {
+    case 'F': return "111100110100100";
+    case 'P': return "110101110100100";
+    case 'S': return "111100111001111";
+    case '0': return "111101101101111";
+    case '1': return "010110010010111";
+    case '2': return "111001111100111";
+    case '3': return "111001111001111";
+    case '4': return "101101111001001";
+    case '5': return "111100111001111";
+    case '6': return "111100111101111";
+    case '7': return "111001001001001";
+    case '8': return "111101111101111";
+    case '9': return "111101111001111";
+    case ' ': return "000000000000000";
+    default:  return "000000000000000";
     }
-    return "";
 }
 
 } // namespace
@@ -44,9 +60,9 @@ bool Application::Init()
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
         return false;
     }
-    m_baseDir = BaseDir();
+    
 
-    m_config = LoadWindowConfig(m_baseDir + "config/window.json");
+    m_config = LoadWindowConfig(ResolveDataPath("config/window.json"));
 
     m_renderer = CreateRenderer();
     LOG_INFO("Renderer backend: %s", m_renderer->GetBackendName());
@@ -65,13 +81,49 @@ bool Application::Init()
         return false;
     }
 
+    if (getenv("ENGINE_DRAG_TEST")) {
+        int pw = 0, ph = 0; m_window.GetPixelSize(pw, ph);
+        const auto toScreen = [&](float wx, float wy, float& sx, float& sy) {
+            sx = (wx - m_camera.X()) * m_camera.Zoom() + pw * 0.5f;
+            sy = (wy - m_camera.Y()) * m_camera.Zoom() + ph * 0.5f;
+        };
+        const Light& l0 = m_environment.lights[0];
+        const float ox = l0.x, oy = l0.y, odx = l0.dirX, ody = l0.dirY;
+
+        // 1) grab the light body and move it +100,+50 world px
+        float sx=0, sy=0; toScreen(ox, oy, sx, sy);
+        LOG_INFO("[dragtest] grab body at screen (%.0f,%.0f): %s", sx, sy,
+                 BeginLightDrag(sx, sy) ? "HIT" : "MISS");
+        UpdateLightDrag(sx + 100.0f * m_camera.Zoom(), sy + 50.0f * m_camera.Zoom());
+        LOG_INFO("[dragtest] moved  (%.1f,%.1f) -> (%.1f,%.1f)  expect (%.1f,%.1f)",
+                 ox, oy, m_environment.lights[0].x, m_environment.lights[0].y, ox+100.0f, oy+50.0f);
+        m_dragTarget = DragTarget::None; m_dragLight = -1;
+
+        // 2) grab the aim handle and point the light straight down
+        const Light& l1 = m_environment.lights[0];
+        float hx=0, hy=0;
+        toScreen(l1.x + l1.dirX * (kDirDistancePx / m_camera.Zoom()),
+                 l1.y + l1.dirY * (kDirDistancePx / m_camera.Zoom()), hx, hy);
+        LOG_INFO("[dragtest] grab aim at screen (%.0f,%.0f): %s", hx, hy,
+                 BeginLightDrag(hx, hy) ? "HIT" : "MISS");
+        float bx=0, by=0; toScreen(l1.x, l1.y, bx, by);
+        UpdateLightDrag(bx, by + 200.0f);
+        LOG_INFO("[dragtest] dir (%.2f,%.2f) -> (%.2f,%.2f)  expect (0.00,1.00)",
+                 odx, ody, m_environment.lights[0].dirX, m_environment.lights[0].dirY);
+        m_dragTarget = DragTarget::None; m_dragLight = -1;
+
+        // 3) empty space must not grab anything
+        LOG_INFO("[dragtest] click empty space: %s (expect MISS)",
+                 BeginLightDrag(5.0f, 5.0f) ? "HIT" : "MISS");
+    }
+
     m_lastFrameNs = SDL_GetTicksNS();
     return true;
 }
 
 bool Application::RebuildWorld()
 {
-    if (!m_scripts.RunFile(m_baseDir + "scripts/main.lua")) {
+    if (!m_scripts.RunFile(ResolveDataPath("scripts/main.lua"))) {
         LOG_WARN("Scene script failed; continuing with defaults");
     }
 
@@ -101,7 +153,7 @@ bool Application::RebuildWorld()
 
     m_registry.Freeze();
 
-    const TileRenderData renderData = BuildTileRenderData(m_registry, m_baseDir);
+    const TileRenderData renderData = BuildTileRenderData(m_registry);
 
     if (!m_map.Create(m_world.width, m_world.height)) {
         return false;
@@ -115,9 +167,27 @@ bool Application::RebuildWorld()
     int x = 0, y = 0, w = 0, h = 0;
     m_map.TakeDirtyRegion(x, y, w, h);  // CreateTileResources uploaded everything
 
+    m_environment.Clear();
+    m_scripts.ReadEnvironment(m_environment, kTileSizePx);
+
+    // The occlusion mask is cached: rebuilt here when walls change, never per
+    // frame. It covers the whole map in world pixels.
+    m_renderer->SetOccluders(m_environment.walls.data(),
+                             static_cast<int>(m_environment.walls.size()),
+                             0.0f, 0.0f,
+                             m_map.Width() * kTileSizePx,
+                             m_map.Height() * kTileSizePx);
+
     m_camera.Configure(m_world.editor,
                        static_cast<int>(m_map.Width() * kTileSizePx),
                        static_cast<int>(m_map.Height() * kTileSizePx));
+
+    // Prime the camera's viewport: events are handled before Update runs, so
+    // without this a click on the very first frame would unproject wrongly.
+    int pixelWidth = 0, pixelHeight = 0;
+    m_window.GetPixelSize(pixelWidth, pixelHeight);
+    m_camera.Update(0.0f, 0.0f, 0.0f, pixelWidth, pixelHeight);
+
     m_panUp = m_panDown = m_panLeft = m_panRight = false;
     return true;
 }
@@ -154,12 +224,17 @@ void Application::HandleEvent(const SDL_Event& event, bool& running)
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         if (event.button.button == SDL_BUTTON_MIDDLE) {
             m_camera.BeginDrag(event.button.x * scale, event.button.y * scale);
+        } else if (event.button.button == SDL_BUTTON_LEFT) {
+            BeginLightDrag(event.button.x * scale, event.button.y * scale);
         }
         break;
 
     case SDL_EVENT_MOUSE_BUTTON_UP:
         if (event.button.button == SDL_BUTTON_MIDDLE) {
             m_camera.EndDrag();
+        } else if (event.button.button == SDL_BUTTON_LEFT) {
+            m_dragTarget = DragTarget::None;
+            m_dragLight  = -1;
         }
         break;
 
@@ -199,8 +274,10 @@ void Application::MainLoop()
         }
 
         const uint64_t nowNs = SDL_GetTicksNS();
-        const float dt = std::min(0.1f, static_cast<float>(nowNs - m_lastFrameNs) * 1e-9f);
+        const float frameSeconds = static_cast<float>(nowNs - m_lastFrameNs) * 1e-9f;
+        const float dt = std::min(0.1f, frameSeconds);
         m_lastFrameNs  = nowNs;
+        UpdateFps(frameSeconds);
 
         float mouseX = 0.0f, mouseY = 0.0f;
         SDL_GetMouseState(&mouseX, &mouseY);
@@ -212,6 +289,7 @@ void Application::MainLoop()
         m_camera.SetPanInput(static_cast<float>(m_panRight) - static_cast<float>(m_panLeft),
                              static_cast<float>(m_panDown) - static_cast<float>(m_panUp));
         m_camera.Update(dt, mouseX * scale, mouseY * scale, pixelW, pixelH);
+        UpdateLightDrag(mouseX * scale, mouseY * scale);
 
         int dx = 0, dy = 0, dw = 0, dh = 0;
         if (m_map.TakeDirtyRegion(dx, dy, dw, dh)) {
@@ -219,6 +297,182 @@ void Application::MainLoop()
         }
 
         RenderFrame();
+    }
+}
+
+void Application::UpdateFps(float frameSeconds)
+{
+    if (!(frameSeconds > 0.0f)) {
+        return;
+    }
+
+    m_fpsElapsed += frameSeconds;
+    ++m_fpsFrames;
+
+    // Half a second reacts quickly to real performance changes without making
+    // the displayed integer flicker from one unusually long frame.
+    if (m_fpsElapsed >= 0.5f) {
+        m_displayFps = static_cast<uint32_t>(
+            std::lround(static_cast<float>(m_fpsFrames) / m_fpsElapsed));
+        m_fpsElapsed = 0.0f;
+        m_fpsFrames  = 0;
+    }
+}
+
+bool Application::BeginLightDrag(float mousePxX, float mousePxY)
+{
+    float worldX = 0.0f, worldY = 0.0f;
+    m_camera.ScreenToWorld(mousePxX, mousePxY, worldX, worldY);
+
+    const float zoom       = m_camera.Zoom();
+    const float pickRadius = kHandlePx / zoom;      // constant on screen
+    const float dirRadius  = kDirHandlePx / zoom;
+    const float dirOffset  = kDirDistancePx / zoom;
+
+    // Direction handles sit on top of the bodies, so test them first.
+    for (size_t i = 0; i < m_environment.lights.size(); ++i) {
+        const Light& light = m_environment.lights[i];
+        const float hx = light.x + light.dirX * dirOffset;
+        const float hy = light.y + light.dirY * dirOffset;
+        const float dx = worldX - hx, dy = worldY - hy;
+        if (dx * dx + dy * dy <= dirRadius * dirRadius) {
+            m_dragTarget = DragTarget::Direction;
+            m_dragLight  = static_cast<int>(i);
+            return true;
+        }
+    }
+
+    for (size_t i = 0; i < m_environment.lights.size(); ++i) {
+        const Light& light = m_environment.lights[i];
+        const float dx = worldX - light.x, dy = worldY - light.y;
+        if (dx * dx + dy * dy <= pickRadius * pickRadius) {
+            m_dragTarget  = DragTarget::Position;
+            m_dragLight   = static_cast<int>(i);
+            m_dragOffsetX = light.x - worldX;
+            m_dragOffsetY = light.y - worldY;
+            return true;
+        }
+    }
+    return false;
+}
+
+void Application::UpdateLightDrag(float mousePxX, float mousePxY)
+{
+    if (m_dragTarget == DragTarget::None || m_dragLight < 0 ||
+        m_dragLight >= static_cast<int>(m_environment.lights.size())) {
+        return;
+    }
+
+    float worldX = 0.0f, worldY = 0.0f;
+    m_camera.ScreenToWorld(mousePxX, mousePxY, worldX, worldY);
+    Light& light = m_environment.lights[m_dragLight];
+
+    if (m_dragTarget == DragTarget::Position) {
+        light.x = worldX + m_dragOffsetX;
+        light.y = worldY + m_dragOffsetY;
+        return;
+    }
+
+    const float dx = worldX - light.x, dy = worldY - light.y;
+    const float length = std::sqrt(dx * dx + dy * dy);
+    if (length > 1e-4f) {
+        light.dirX = dx / length;
+        light.dirY = dy / length;
+    }
+}
+
+void Application::DrawLightHandles()
+{
+    const float zoom = m_camera.Zoom();
+    int pixelW = 0, pixelH = 0;
+    m_window.GetPixelSize(pixelW, pixelH);
+
+    // World -> screen, matching the tile and light shaders.
+    const auto toScreen = [&](float wx, float wy, float& sx, float& sy) {
+        sx = (wx - m_camera.X()) * zoom + pixelW * 0.5f;
+        sy = (wy - m_camera.Y()) * zoom + pixelH * 0.5f;
+    };
+
+    for (size_t i = 0; i < m_environment.lights.size(); ++i) {
+        const Light& light  = m_environment.lights[i];
+        const bool   active = static_cast<int>(i) == m_dragLight &&
+                              m_dragTarget != DragTarget::None;
+
+        float bodyX = 0.0f, bodyY = 0.0f;
+        toScreen(light.x, light.y, bodyX, bodyY);
+
+        // Quads do not blend, so the border is drawn first and the coloured
+        // body over it, leaving a visible frame. It widens while dragging.
+        Quad border;
+        border.w = border.h = kHandlePx + (active ? 10.0f : 5.0f);
+        border.x = bodyX - border.w * 0.5f;
+        border.y = bodyY - border.h * 0.5f;
+        border.color = Color{1.0f, 1.0f, 1.0f, 1.0f};
+        m_renderer->DrawQuad(border);
+
+        Quad body;
+        body.w = body.h = kHandlePx;
+        body.x = bodyX - kHandlePx * 0.5f;
+        body.y = bodyY - kHandlePx * 0.5f;
+        body.color = light.color;
+        body.color.a = 1.0f;
+        m_renderer->DrawQuad(body);
+
+        float dirX = 0.0f, dirY = 0.0f;
+        toScreen(light.x + light.dirX * (kDirDistancePx / zoom),
+                 light.y + light.dirY * (kDirDistancePx / zoom), dirX, dirY);
+
+        Quad aim;
+        aim.w = aim.h = kDirHandlePx;
+        aim.x = dirX - kDirHandlePx * 0.5f;
+        aim.y = dirY - kDirHandlePx * 0.5f;
+        aim.color = Color{1.0f, 1.0f, 1.0f, 0.85f};
+        m_renderer->DrawQuad(aim);
+    }
+}
+
+void Application::DrawFpsOverlay()
+{
+    int pixelW = 0, pixelH = 0;
+    int logicalW = 0, logicalH = 0;
+    m_window.GetPixelSize(pixelW, pixelH);
+    SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
+
+    const float densityX = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
+    const float densityY = logicalH > 0 ? static_cast<float>(pixelH) / logicalH : densityX;
+    const float density  = std::max(1.0f, std::min(densityX, densityY));
+    const float cell     = std::max(2.0f, std::round(3.0f * density));
+    const float padding  = cell * 1.5f;
+    const float originX  = cell * 2.0f;
+    const float originY  = cell * 2.0f;
+    const std::string label =
+        "FPS " + std::to_string(std::min<uint32_t>(m_displayFps, 9999));
+
+    Quad panel;
+    panel.x = originX - padding;
+    panel.y = originY - padding;
+    panel.w = (static_cast<float>(label.size() * 4 - 1) * cell) + padding * 2.0f;
+    panel.h = 5.0f * cell + padding * 2.0f;
+    panel.color = Color{0.025f, 0.03f, 0.04f, 1.0f};
+    m_renderer->DrawQuad(panel);
+
+    const Color textColor{0.72f, 1.0f, 0.76f, 1.0f};
+    for (size_t glyphIndex = 0; glyphIndex < label.size(); ++glyphIndex) {
+        const char* glyph = FpsGlyph(label[glyphIndex]);
+        for (int row = 0; row < 5; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                if (glyph[row * 3 + column] != '1') {
+                    continue;
+                }
+                Quad pixel;
+                pixel.x = originX + static_cast<float>(glyphIndex * 4 + column) * cell;
+                pixel.y = originY + static_cast<float>(row) * cell;
+                pixel.w = cell;
+                pixel.h = cell;
+                pixel.color = textColor;
+                m_renderer->DrawQuad(pixel);
+            }
+        }
     }
 }
 
@@ -243,9 +497,19 @@ void Application::RenderFrame()
 
     m_renderer->BeginFrame(m_scene.clearColor);
     m_renderer->DrawTileMap(constants);
+    // Volumetric scattering belongs behind opaque scene geometry. Drawing it
+    // after walls exposed the ray march inside each blocker as a noisy,
+    // translucent band along the lit edge.
+    m_renderer->DrawLighting(m_environment.lights.data(),
+                             static_cast<int>(m_environment.lights.size()),
+                             constants);
+    m_renderer->DrawWalls(m_environment.walls.data(),
+                          static_cast<int>(m_environment.walls.size()));
+    DrawLightHandles();
     for (const Quad& quad : m_scene.quads) {
         m_renderer->DrawQuad(quad);
     }
+    DrawFpsOverlay();
     m_renderer->EndFrame();
 }
 
