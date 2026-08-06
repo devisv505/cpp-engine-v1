@@ -1,5 +1,7 @@
 # Cpp Engine
 
+[![CI](https://github.com/devisv505/cpp-engine-v1/actions/workflows/ci.yml/badge.svg)](https://github.com/devisv505/cpp-engine-v1/actions/workflows/ci.yml)
+
 Cross-platform C++20 engine skeleton: SDL3 for windowing and events, with a
 renderer abstraction whose backend is chosen per platform at compile time.
 
@@ -99,6 +101,21 @@ Window created: "Cpp Engine" 1280x720 resizable
 [Metal] CAMetalLayer attached to device
 ```
 
-The Vulkan and D3D12 paths follow standard initialization patterns but have
-only been verified structurally on macOS; a CI matrix (windows-latest MSVC,
-ubuntu-latest + Vulkan SDK) is the natural next step to compile-check them.
+## CI and releases
+
+Every push and pull request to `main` builds all three platforms on GitHub
+Actions (Windows/MSVC + D3D12, Ubuntu + Vulkan, macOS + Metal). CI builds use
+`-DENGINE_FETCH_SDL=ON`, which compiles SDL3 from source and links it
+statically, so the produced binaries are self-contained.
+
+Publishing a release is tag-driven:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow builds all three platforms, packages each binary with
+`config/window.json`, README, and LICENSE, and publishes them on the
+[Releases page](https://github.com/devisv505/cpp-engine-v1/releases) with
+auto-generated notes.

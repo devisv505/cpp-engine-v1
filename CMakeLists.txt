@@ -22,11 +22,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # SDL3: prefer an installed package, fall back to building it from source.
-find_package(SDL3 CONFIG QUIET)
+# ENGINE_FETCH_SDL=ON skips the system package entirely; CI and release builds
+# use it so binaries always link a known SDL built statically (self-contained,
+# no dylib/dll/so dependency for people downloading a release).
+option(ENGINE_FETCH_SDL "Always build SDL3 from source instead of using an installed package" OFF)
+
+if(NOT ENGINE_FETCH_SDL)
+  find_package(SDL3 CONFIG QUIET)
+endif()
 if(NOT SDL3_FOUND)
-  message(STATUS "System SDL3 not found; fetching SDL 3.4.12 from source")
+  message(STATUS "Building SDL 3.4.12 from source (static)")
   include(FetchContent)
   set(SDL_TEST_LIBRARY OFF)
+  set(SDL_SHARED OFF)
+  set(SDL_STATIC ON)
   FetchContent_Declare(SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
     GIT_TAG        release-3.4.12
