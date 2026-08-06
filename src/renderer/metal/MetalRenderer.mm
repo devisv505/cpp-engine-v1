@@ -498,7 +498,7 @@ void MetalRenderer::DrawLighting(const Light* lights, int lightCount,
             light.softness,
             light.mode == LightMode::ScreenSpace ? 1.0f : 0.0f,
             camera.cameraX, camera.cameraY,
-            camera.zoom, 0.0f,
+            camera.zoom, light.pixelArt ? 1.0f : 0.0f,
             camera.viewportW, camera.viewportH,
             0.0f, 0.0f,
         };

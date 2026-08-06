@@ -87,18 +87,19 @@ map_environment = {
             distance      = 20.0,
             angle         = 18.0,
             edge_softness = 0.05,
+--             style         = "pixel-art", -- optional; "smooth" is the default
         },
-        -- The one important light using the screen-space god-ray mode.
---         {
---             position      = at(20.0, 5.0),
---             direction     = { 0.0, 1.0 },
---             mode          = "screen-space",
---             color         = { 1.00, 0.93, 0.70, 1.0 },
---             intensity     = 1.4,
---             distance      = 15.0,
---             angle         = 360.0,
---             edge_softness = 1.0,
---         },
+        -- Omnidirectional screen-space light with wall-cast shafts.
+        {
+            position      = at(20.0, 5.0),
+            direction     = { 0.0, 1.0 },
+            mode          = "screen-space",
+            color         = { 1.00, 0.93, 0.70, 1.0 },
+            intensity     = 0.4,
+            distance      = 15.0,
+            angle         = 360.0,
+            edge_softness = 1.0,
+        },
     },
 }
 

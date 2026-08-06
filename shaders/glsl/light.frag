@@ -14,10 +14,10 @@
 //   32  float range         beam length, world pixels
 //   36  float cosHalfAngle  cone half-angle, precomputed cosine
 //   40  float softness      0 hard edge .. 1 fully feathered
-//   44  float mode          0 = volumetric cone, 1 = screen-space god rays
+//   44  float mode          0 = volumetric cone, 1 = screen-space light
 //   48  vec2  camera        world position at the viewport center
 //   56  float zoom          screen pixels per world pixel
-//   60  float pad0          keeps the following vec2 8-byte aligned
+//   60  float pixelArt      0 = smooth, 1 = pixel-art style
 //   64  vec2  viewport      framebuffer size in pixels
 //   72  vec2  maskOrigin    world pixels of the mask's top-left corner
 //   80  vec2  maskSize      world pixels the mask spans
@@ -32,7 +32,7 @@ layout(push_constant) uniform LightConstants {
     float mode;
     vec2  camera;
     float zoom;
-    float pad0;
+    float pixelArt;
     vec2  viewport;
     vec2  maskOrigin;
     vec2  maskSize;
@@ -43,11 +43,6 @@ layout(push_constant) uniform LightConstants {
 layout(set = 0, binding = 0) uniform sampler2D occlusionMask;
 
 layout(location = 0) out vec4 outColor;
-
-const int   kShadowSteps = 24;    // samples along the light -> fragment ray
-const int   kRaySteps    = 32;    // samples along the god-ray radial blur
-const float kRayDecay    = 0.96;  // per-step weight of the radial blur
-const float kShadowBite  = 0.9;   // how much one occluded sample dims the ray
 
 // Cheap per-pixel hash. Dithering the march start turns the fixed step count
 // into noise instead of visible banding.
@@ -61,6 +56,12 @@ float Hash(vec2 p)
 float DitherIGN(vec2 p)
 {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+float PixelLevel(float value)
+{
+    const float levels = 6.0;
+    return floor(clamp(value, 0.0, 1.0) * levels + 0.5) / levels;
 }
 
 // 0 outside the mask: the world beyond it simply has no occluders recorded.
@@ -84,7 +85,12 @@ vec2 ScreenToWorld(vec2 screenPx)
 
 void main()
 {
+    bool  pixelated = light.pixelArt > 0.5;
     vec2  worldPx = ScreenToWorld(gl_FragCoord.xy);
+    if (pixelated) {
+        const float cellSize = 4.0;
+        worldPx = floor(worldPx / cellSize) * cellSize + cellSize * 0.5;
+    }
     vec2  toFrag  = worldPx - light.position;
     float dist    = length(toFrag);
 
@@ -95,24 +101,25 @@ void main()
 
     float radial = 1.0 - dist / light.range;  // linear falloff ...
     radial *= radial;                         // ... squared, so the rim fades out
-    float dither = DitherIGN(gl_FragCoord.xy);
+    // A fixed midpoint keeps pixel-art blocks stable; smooth lights retain
+    // per-pixel jitter to hide ray-march bands.
+    float dither = pixelated ? 0.5 : DitherIGN(gl_FragCoord.xy);
 
     if (light.mode > 0.5) {
-        // God rays: a radial blur of the mask from the fragment toward the
-        // light, so unoccluded runs accumulate into visible shafts. The march
-        // interpolates in world space, which visits exactly the same points as
-        // marching toward the light's screen position -- the camera transform
-        // is affine -- and skips a per-sample conversion back.
-        float shafts = 0.0;
-        float decay  = 1.0;
-        for (int i = 0; i < kRaySteps; ++i) {
-            float t = (float(i) + dither) / float(kRaySteps);
-            shafts += (1.0 - Occlusion(mix(worldPx, light.position, t))) * decay;
-            decay  *= kRayDecay;
+        // Screen-space lights are omnidirectional, but their visibility is
+        // still line-of-sight. Integrating blocker depth prevents open samples
+        // on either side of a wall from incorrectly lighting pixels behind it.
+        int steps = int(clamp(dist / 4.0, 16.0, 96.0));
+        float stepLength = dist / float(steps);
+        float depth = 0.0;
+        for (int i = 1; i <= steps; ++i) {
+            float t = (float(i) - dither) / float(steps);
+            depth += Occlusion(light.position + toFrag * t) * stepLength;
         }
-        shafts /= float(kRaySteps);
-
-        outColor = vec4(light.color.rgb * shafts * radial, 1.0);
+        float visibility = exp(-depth * 0.25);
+        float amount = visibility * radial;
+        amount = pixelated ? PixelLevel(amount) : amount;
+        outColor = vec4(light.color.rgb * amount, 1.0);
         return;
     }
 
@@ -146,5 +153,7 @@ void main()
     // 0.25 per world pixel: a half-tile (16 px) wall transmits ~2%.
     float visibility = exp(-depth * 0.25);
 
-    outColor = vec4(light.color.rgb * cone * radial * visibility, 1.0);
+    float amount = cone * radial * visibility;
+    amount = pixelated ? PixelLevel(amount) : amount;
+    outColor = vec4(light.color.rgb * amount, 1.0);
 }

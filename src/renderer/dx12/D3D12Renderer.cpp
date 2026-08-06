@@ -43,7 +43,7 @@ struct OccluderPassConstants {
 //
 //  DWORD  0- 1  lightPos          DWORD 12-13  camera
 //  DWORD  2- 3  lightDir          DWORD 14     zoom
-//  DWORD  4- 7  lightColor        DWORD 15     pad0
+//  DWORD  4- 7  lightColor        DWORD 15     pixelArt
 //  DWORD  8     lightDistance     DWORD 16-17  viewport
 //  DWORD  9     cosHalfAngle      DWORD 18-19  pad1
 //  DWORD 10     softness          DWORD 20-23  maskRect
@@ -58,7 +58,7 @@ struct LightPassConstants {
     float mode;
     float camera[2];
     float zoom;
-    float pad0;
+    float pixelArt;
     float viewport[2];
     float pad1[2];
     float maskRect[4];
@@ -74,6 +74,8 @@ static_assert(kOccluderConstantCount == 8, "occluder constants must stay 8 DWORD
 static_assert(kLightConstantCount == 24, "light constants must stay 24 DWORDs");
 static_assert(offsetof(LightPassConstants, camera) == 12 * sizeof(float),
               "light cbuffer packing: camera must land on DWORD 12");
+static_assert(offsetof(LightPassConstants, pixelArt) == 15 * sizeof(float),
+              "light cbuffer packing: pixelArt must land on DWORD 15");
 static_assert(offsetof(LightPassConstants, maskRect) == 20 * sizeof(float),
               "light cbuffer packing: maskRect must land on DWORD 20");
 
@@ -1874,7 +1876,7 @@ void D3D12Renderer::DrawLighting(const Light* lights, int lightCount,
         constants.maskRect[2] = m_maskWorldW;
         constants.maskRect[3] = m_maskWorldH;
 
-        // Cones first, then the screen-space god rays; both accumulate through
+        // Cones first, then the screen-space lights; both accumulate through
         // the same additive pipeline, so the split costs nothing.
         for (int pass = 0; pass < 2; ++pass) {
             const LightMode wanted =
@@ -1921,6 +1923,7 @@ void D3D12Renderer::DrawLighting(const Light* lights, int lightCount,
                 constants.cosHalfAngle  = std::cos(angleDeg * 0.5f * kDegToRad);
                 constants.softness      = softness;
                 constants.mode          = wanted == LightMode::ScreenSpace ? 1.0f : 0.0f;
+                constants.pixelArt      = light.pixelArt ? 1.0f : 0.0f;
 
                 if (m_boundPipeline != BoundPipeline::Light) {
                     BindLightPipeline();

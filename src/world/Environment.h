@@ -19,7 +19,7 @@ struct Wall {
 
 enum class LightMode {
     VolumetricCone,   // cheap: analytic cone, raymarched against the occlusion mask
-    ScreenSpace,      // god rays: radial blur of the mask from the light's position
+    ScreenSpace,      // omnidirectional light with mask-cast volumetric shafts
 };
 
 struct Light {
@@ -31,6 +31,7 @@ struct Light {
     float     distance  = 320.0f;        // beam length, world pixels
     float     angleDeg  = 35.0f;         // full cone angle
     float     softness  = 0.25f;         // 0 = hard edge, 1 = fully feathered
+    bool      pixelArt  = false;         // world-aligned blocks and discrete light levels
 };
 
 struct Environment {

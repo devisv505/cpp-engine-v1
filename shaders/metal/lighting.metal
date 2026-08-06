@@ -11,10 +11,10 @@ struct LightConstants {
     float  lightDistance; // 48
     float  cosHalfAngle;  // 52
     float  softness;      // 56
-    float  mode;          // 60: 0 = cone, 1 = god rays
+    float  mode;          // 60: 0 = cone, 1 = screen-space light
     float2 camera;        // 64: world pixels at viewport centre
     float  zoom;          // 72
-    float  pad0;          // 76
+    float  pixelArt;      // 76: 0 = smooth, 1 = pixel-art style
     float2 viewport;      // 80
     float2 pad1;          // 88
 };
@@ -37,6 +37,12 @@ static inline float hash12(float2 p)
     return fract(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453);
 }
 
+static inline float pixel_level(float value)
+{
+    constexpr float LEVELS = 6.0;
+    return floor(clamp(value, 0.0, 1.0) * LEVELS + 0.5) / LEVELS;
+}
+
 static inline float sample_mask(texture2d<float> mask, sampler s, float2 world, float4 maskRect)
 {
     float2 uv = (world - maskRect.xy) / maskRect.zw;
@@ -52,7 +58,12 @@ fragment float4 light_fragment(float4 position [[position]],
 {
     constexpr sampler linearClamp(filter::linear, address::clamp_to_edge);
 
+    bool pixelated = c.pixelArt > 0.5;
     float2 worldPx = c.camera + (position.xy - c.viewport * 0.5) / c.zoom;
+    if (pixelated) {
+        constexpr float CELL_SIZE = 4.0;
+        worldPx = floor(worldPx / CELL_SIZE) * CELL_SIZE + CELL_SIZE * 0.5;
+    }
     float2 toFrag  = worldPx - c.lightPos;
     float  dist    = length(toFrag);
     if (dist > c.lightDistance) {
@@ -61,22 +72,27 @@ fragment float4 light_fragment(float4 position [[position]],
 
     float radial = 1.0 - dist / c.lightDistance;
     radial *= radial;
-    float dither = dither_ign(position.xy);
+    // A fixed midpoint keeps pixel-art blocks stable; smooth lights retain
+    // per-pixel jitter to hide ray-march bands.
+    float dither = pixelated ? 0.5 : dither_ign(position.xy);
 
     if (c.mode > 0.5) {
-        // God rays: march from the fragment toward the light in screen space,
-        // accumulating unoccluded samples with exponential decay.
-        const int STEPS = 32;
-        float shaft = 0.0;
-        float decay = 1.0;
-        for (int i = 0; i < STEPS; ++i) {
-            float t = (float(i) + dither) / float(STEPS);
-            float2 p = mix(worldPx, c.lightPos, t);
-            shaft += (1.0 - sample_mask(mask, linearClamp, p, c.maskRect)) * decay;
-            decay *= 0.96;
+        // Screen-space lights are omnidirectional, but their visibility is
+        // still line-of-sight. Integrating blocker depth prevents open samples
+        // on either side of a wall from incorrectly lighting pixels behind it.
+        const float MASK_TEXEL = 4.0;
+        int steps = int(clamp(dist / MASK_TEXEL, 16.0, 96.0));
+        float stepLength = dist / float(steps);
+        float depth = 0.0;
+        for (int i = 1; i <= steps; ++i) {
+            float t = (float(i) - dither) / float(steps);
+            float2 p = c.lightPos + toFrag * t;
+            depth += sample_mask(mask, linearClamp, p, c.maskRect) * stepLength;
         }
-        shaft /= float(STEPS);
-        return float4(c.lightColor.rgb * shaft * radial, 1.0);
+        float visibility = exp(-depth * 0.25);
+        float amount = visibility * radial;
+        amount = pixelated ? pixel_level(amount) : amount;
+        return float4(c.lightColor.rgb * amount, 1.0);
     }
 
     float2 dirToFrag = dist > 1e-4 ? toFrag / dist : c.lightDir;
@@ -111,6 +127,7 @@ fragment float4 light_fragment(float4 position [[position]],
     // 0.25 per world pixel: a half-tile (16 px) wall transmits ~2%.
     float vis = exp(-depth * 0.25);
 
-    return float4(c.lightColor.rgb * cone * radial * vis, 1.0);
+    float amount = cone * radial * vis;
+    amount = pixelated ? pixel_level(amount) : amount;
+    return float4(c.lightColor.rgb * amount, 1.0);
 }
-

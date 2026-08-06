@@ -479,6 +479,16 @@ void ParseLight(lua_State* L, Environment& environment, float tileSizePx, int in
                  index, mode.c_str());
     }
 
+    const std::string style = FieldString(L, entry, "style", "smooth");
+    if (style == "pixel-art" || style == "pixelated") {
+        light.pixelArt = true;
+    } else if (style != "smooth") {
+        LOG_WARN("map_environment.lights[%d]: unknown style '%s', using smooth",
+                 index, style.c_str());
+    }
+    // Boolean spelling retained as a convenient alias and explicit override.
+    light.pixelArt = FieldBool(L, entry, "pixel_art", light.pixelArt);
+
     FieldColor(L, entry, "color", light.color);
     light.intensity = FieldNumber(L, entry, "intensity", light.intensity);
     light.distance  = FieldNumber(L, entry, "distance", 10.0f) * tileSizePx;
@@ -533,12 +543,15 @@ bool ScriptHost::ReadEnvironment(Environment& environment, float tileSizePx)
     lua_pop(m_L, 1);  // map_environment
 
     size_t coneCount = 0;
+    size_t pixelArtCount = 0;
     for (const Light& light : environment.lights) {
         coneCount += light.mode == LightMode::VolumetricCone ? 1 : 0;
+        pixelArtCount += light.pixelArt ? 1 : 0;
     }
-    LOG_INFO("Environment: %zu wall(s), %zu light(s) (%zu cone, %zu screen-space)",
+    LOG_INFO("Environment: %zu wall(s), %zu light(s) (%zu cone, %zu screen-space, "
+             "%zu pixel-art)",
              environment.walls.size(), environment.lights.size(),
-             coneCount, environment.lights.size() - coneCount);
+             coneCount, environment.lights.size() - coneCount, pixelArtCount);
     return true;
 }
 

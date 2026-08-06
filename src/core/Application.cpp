@@ -14,6 +14,33 @@
 
 namespace engine {
 
+namespace {
+
+// Three columns by five rows, row-major. Only the glyphs used by the FPS HUD
+// are included so the overlay stays independent of a font asset or text API.
+const char* FpsGlyph(char character)
+{
+    switch (character) {
+    case 'F': return "111100110100100";
+    case 'P': return "110101110100100";
+    case 'S': return "111100111001111";
+    case '0': return "111101101101111";
+    case '1': return "010110010010111";
+    case '2': return "111001111100111";
+    case '3': return "111001111001111";
+    case '4': return "101101111001001";
+    case '5': return "111100111001111";
+    case '6': return "111100111101111";
+    case '7': return "111001001001001";
+    case '8': return "111101111101111";
+    case '9': return "111101111001111";
+    case ' ': return "000000000000000";
+    default:  return "000000000000000";
+    }
+}
+
+} // namespace
+
 int Application::Run()
 {
     if (!Init()) {
@@ -247,8 +274,10 @@ void Application::MainLoop()
         }
 
         const uint64_t nowNs = SDL_GetTicksNS();
-        const float dt = std::min(0.1f, static_cast<float>(nowNs - m_lastFrameNs) * 1e-9f);
+        const float frameSeconds = static_cast<float>(nowNs - m_lastFrameNs) * 1e-9f;
+        const float dt = std::min(0.1f, frameSeconds);
         m_lastFrameNs  = nowNs;
+        UpdateFps(frameSeconds);
 
         float mouseX = 0.0f, mouseY = 0.0f;
         SDL_GetMouseState(&mouseX, &mouseY);
@@ -268,6 +297,25 @@ void Application::MainLoop()
         }
 
         RenderFrame();
+    }
+}
+
+void Application::UpdateFps(float frameSeconds)
+{
+    if (!(frameSeconds > 0.0f)) {
+        return;
+    }
+
+    m_fpsElapsed += frameSeconds;
+    ++m_fpsFrames;
+
+    // Half a second reacts quickly to real performance changes without making
+    // the displayed integer flicker from one unusually long frame.
+    if (m_fpsElapsed >= 0.5f) {
+        m_displayFps = static_cast<uint32_t>(
+            std::lround(static_cast<float>(m_fpsFrames) / m_fpsElapsed));
+        m_fpsElapsed = 0.0f;
+        m_fpsFrames  = 0;
     }
 }
 
@@ -383,6 +431,51 @@ void Application::DrawLightHandles()
     }
 }
 
+void Application::DrawFpsOverlay()
+{
+    int pixelW = 0, pixelH = 0;
+    int logicalW = 0, logicalH = 0;
+    m_window.GetPixelSize(pixelW, pixelH);
+    SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
+
+    const float densityX = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
+    const float densityY = logicalH > 0 ? static_cast<float>(pixelH) / logicalH : densityX;
+    const float density  = std::max(1.0f, std::min(densityX, densityY));
+    const float cell     = std::max(2.0f, std::round(3.0f * density));
+    const float padding  = cell * 1.5f;
+    const float originX  = cell * 2.0f;
+    const float originY  = cell * 2.0f;
+    const std::string label =
+        "FPS " + std::to_string(std::min<uint32_t>(m_displayFps, 9999));
+
+    Quad panel;
+    panel.x = originX - padding;
+    panel.y = originY - padding;
+    panel.w = (static_cast<float>(label.size() * 4 - 1) * cell) + padding * 2.0f;
+    panel.h = 5.0f * cell + padding * 2.0f;
+    panel.color = Color{0.025f, 0.03f, 0.04f, 1.0f};
+    m_renderer->DrawQuad(panel);
+
+    const Color textColor{0.72f, 1.0f, 0.76f, 1.0f};
+    for (size_t glyphIndex = 0; glyphIndex < label.size(); ++glyphIndex) {
+        const char* glyph = FpsGlyph(label[glyphIndex]);
+        for (int row = 0; row < 5; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                if (glyph[row * 3 + column] != '1') {
+                    continue;
+                }
+                Quad pixel;
+                pixel.x = originX + static_cast<float>(glyphIndex * 4 + column) * cell;
+                pixel.y = originY + static_cast<float>(row) * cell;
+                pixel.w = cell;
+                pixel.h = cell;
+                pixel.color = textColor;
+                m_renderer->DrawQuad(pixel);
+            }
+        }
+    }
+}
+
 void Application::RenderFrame()
 {
     int pixelW = 0, pixelH = 0;
@@ -416,6 +509,7 @@ void Application::RenderFrame()
     for (const Quad& quad : m_scene.quads) {
         m_renderer->DrawQuad(quad);
     }
+    DrawFpsOverlay();
     m_renderer->EndFrame();
 }
 

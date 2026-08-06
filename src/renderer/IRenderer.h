@@ -73,12 +73,12 @@ public:
     virtual void DrawWalls(const Wall* walls, int wallCount) = 0;
 
     // Accumulates every visible light over the scene. Backends cull lights
-    // against the viewport, run the cone raymarch and the god-ray pass, then
+    // against the viewport, run the cone and screen-space raymarches, then
     // blend the result additively. Valid between Begin/EndFrame.
     virtual void DrawLighting(const Light* lights, int lightCount,
                               const TileDrawConstants& camera) = 0;
 
-    virtual const char* GetBackendName() const = 0;
+    [[nodiscard]] virtual const char* GetBackendName() const = 0;
 };
 
 } // namespace engine

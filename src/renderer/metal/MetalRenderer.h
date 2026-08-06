@@ -30,7 +30,7 @@ public:
     void DrawWalls(const Wall* walls, int wallCount) override;
     void DrawLighting(const Light* lights, int lightCount,
                       const TileDrawConstants& camera) override;
-    const char* GetBackendName() const override { return "Metal"; }
+    [[nodiscard]] const char* GetBackendName() const override { return "Metal"; }
 
 private:
     bool CreateLightingPipelines();

@@ -64,6 +64,24 @@ the patterns and every per-tile operation run in C++. The immediate-mode quad AP
 (`engine.set_clear_color`, `engine.add_quad{...}`, `engine.window_size`,
 `engine.log`) is still available for overlays.
 
+Individual volumetric lights can use a world-aligned pixel-art treatment without
+changing the rest of the scene:
+
+```lua
+map_environment = {
+    lights = {
+        {
+            position = { 8, 8 },
+            direction = { 1, 0 },
+            style = "pixel-art", -- default: "smooth"
+        },
+    },
+}
+```
+
+Pixel-art lights use stable 4×4-world-pixel blocks, discrete brightness levels,
+and non-jittered ray sampling. `pixel_art = true` is also accepted as a shorthand.
+
 Scripts get a deliberately limited standard library (`base`, `string`, `table`, `math` —
 no `io`, `os`, or `package`), so the engine is reachable only through its API.
 A script error is logged with a traceback and leaves the engine running.

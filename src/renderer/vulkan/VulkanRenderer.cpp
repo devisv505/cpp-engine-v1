@@ -1,6 +1,7 @@
 #include "renderer/vulkan/VulkanRenderer.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <fstream>
 #include <string>
@@ -99,7 +100,7 @@ static_assert(sizeof(OccluderPushConstants) == 32, "occluder.vert expects a 32-b
 //
 //    0  vec2  position       48  vec2  camera
 //    8  vec2  direction      56  float zoom
-//   16  vec4  color          60  float pad0
+//   16  vec4  color          60  float pixelArt
 //   32  float range          64  vec2  viewport
 //   36  float cosHalfAngle   72  vec2  maskOrigin
 //   40  float softness       80  vec2  maskSize
@@ -114,7 +115,7 @@ struct LightPushConstants {
     float mode;
     float cameraX, cameraY;
     float zoom;
-    float pad0;
+    float pixelArt;
     float viewportW, viewportH;
     float maskOriginX, maskOriginY;
     float maskSizeX, maskSizeY;
@@ -123,6 +124,8 @@ struct LightPushConstants {
 // 96 bytes: inside the 128 every Vulkan implementation guarantees, which is the
 // only push-constant budget the engine ever assumes.
 static_assert(sizeof(LightPushConstants) == 96, "light.frag expects a 96-byte block");
+static_assert(offsetof(LightPushConstants, pixelArt) == 60,
+              "light.frag expects pixelArt at byte 60");
 
 // Single-mip, single-layer color barrier; the caller picks the pipeline stages.
 VkImageMemoryBarrier MakeImageBarrier(VkImage image, VkImageLayout oldLayout,
@@ -2229,7 +2232,7 @@ void VulkanRenderer::DrawLighting(const Light* lights, int lightCount,
     constants.maskSizeX   = m_maskWorldW;
     constants.maskSizeY   = m_maskWorldH;
 
-    // Cones first, then the god-ray lights: both use the same additive
+    // Cones first, then the screen-space lights: both use the same additive
     // pipeline, and `mode` picks the branch inside light.frag.
     for (int pass = 0; pass < 2; ++pass) {
         const LightMode wanted =
@@ -2276,6 +2279,7 @@ void VulkanRenderer::DrawLighting(const Light* lights, int lightCount,
                 std::cos(std::clamp(light.angleDeg, 0.0f, 360.0f) * 0.5f * kPi / 180.0f);
             constants.softness = std::clamp(light.softness, 0.0f, 1.0f);
             constants.mode     = pass == 0 ? 0.0f : 1.0f;
+            constants.pixelArt = light.pixelArt ? 1.0f : 0.0f;
 
             vkCmdPushConstants(commandBuffer, m_lightPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(LightPushConstants), &constants);

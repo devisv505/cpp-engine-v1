@@ -6,10 +6,10 @@ cbuffer LightConstants : register(b0)
     float  lightDistance;  // beam length, world pixels
     float  cosHalfAngle;
     float  softness;       // 0 hard edge .. 1 fully feathered
-    float  mode;           // 0 = cone, 1 = screen-space god rays
+    float  mode;           // 0 = cone, 1 = screen-space light
     float2 camera;         // world pixels at the viewport center
     float  zoom;           // screen pixels per world pixel
-    float  pad0;
+    float  pixelArt;       // 0 = smooth, 1 = pixel-art style
     float2 viewport;       // framebuffer size in pixels
     float2 pad1;
     float4 maskRect;       // mask origin xy, mask size zw, in world pixels
@@ -45,6 +45,12 @@ float DitherIGN(float2 p)
     return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
 
+float PixelLevel(float value)
+{
+    const float levels = 6.0;
+    return floor(saturate(value) * levels + 0.5) / levels;
+}
+
 // World position -> mask UV. Anything outside the mask counts as unoccluded.
 float OcclusionAt(float2 world)
 {
@@ -59,7 +65,12 @@ float4 PSMain(VSOutput input) : SV_Target
 {
     // SV_Position is top-left-origin with +Y down, which matches world space,
     // so there are no axis flips here.
+    const bool pixelated = pixelArt > 0.5;
     float2 worldPx = camera + (input.position.xy - viewport * 0.5) / zoom;
+    if (pixelated) {
+        const float cellSize = 4.0;
+        worldPx = floor(worldPx / cellSize) * cellSize + cellSize * 0.5;
+    }
     float2 toFrag  = worldPx - lightPos;
     float  dist    = length(toFrag);
     if (dist > lightDistance) {
@@ -69,22 +80,23 @@ float4 PSMain(VSOutput input) : SV_Target
     float radial = 1.0 - dist / lightDistance;
     radial *= radial;
     // Per-pixel dither on the march start hides the stepping as banding.
-    float dither = DitherIGN(input.position.xy);
+    float dither = pixelated ? 0.5 : DitherIGN(input.position.xy);
 
     if (mode > 0.5) {
-        // God rays: march from the fragment toward the light, accumulating
-        // unoccluded samples with exponential decay.
-        const int RAY_STEPS = 32;
-        float shaft = 0.0;
-        float decay = 1.0;
-        [loop] for (int i = 0; i < RAY_STEPS; ++i) {
-            float  t = (float(i) + dither) / float(RAY_STEPS);
-            float2 p = lerp(worldPx, lightPos, t);
-            shaft += (1.0 - OcclusionAt(p)) * decay;
-            decay *= 0.96;
+        // Screen-space lights are omnidirectional, but their visibility is
+        // still line-of-sight. Integrating blocker depth prevents open samples
+        // on either side of a wall from incorrectly lighting pixels behind it.
+        int screenSteps = (int)clamp(dist / 4.0, 16.0, 96.0);
+        float stepLength = dist / (float)screenSteps;
+        float depth = 0.0;
+        [loop] for (int i = 1; i <= screenSteps; ++i) {
+            float t = (float(i) - dither) / (float)screenSteps;
+            depth += OcclusionAt(lightPos + toFrag * t) * stepLength;
         }
-        shaft /= float(RAY_STEPS);
-        return float4(lightColor.rgb * shaft * radial, 1.0);
+        float visibility = exp(-depth * 0.25);
+        float amount = visibility * radial;
+        amount = pixelated ? PixelLevel(amount) : amount;
+        return float4(lightColor.rgb * amount, 1.0);
     }
 
     float2 dirToFrag = dist > 1e-4 ? toFrag / dist : lightDir;
@@ -117,5 +129,7 @@ float4 PSMain(VSOutput input) : SV_Target
     // 0.25 per world pixel: a half-tile (16 px) wall transmits ~2%.
     float vis = exp(-depth * 0.25);
 
-    return float4(lightColor.rgb * cone * radial * vis, 1.0);
+    float amount = cone * radial * vis;
+    amount = pixelated ? PixelLevel(amount) : amount;
+    return float4(lightColor.rgb * amount, 1.0);
 }
