@@ -1,0 +1,10 @@
+{
+  "window": {
+    "title": "Cpp Engine",
+    "width": 1280,
+    "height": 720,
+    "fullscreen": false,
+    "resizable": true,
+    "vsync": true
+  }
+}
