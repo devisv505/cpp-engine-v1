@@ -90,6 +90,27 @@ bool Application::RebuildWorld()
     m_registry = TileRegistry();
     m_world    = WorldConfig();
     m_scripts.ReadWorldConfig(m_world, m_registry);
+
+    // A script that defines no usable tiles would generate an all-void (black)
+    // map, which reads as a broken engine. Fall back to the default two-tone
+    // checkerboard so the editor always starts on something meaningful.
+    if (m_world.params.tiles.empty()) {
+        LOG_WARN("Script defined no map tiles; falling back to the default checkerboard");
+        TilePrototype dark;
+        dark.name  = "default_dark";
+        dark.color = Color{0.16f, 0.16f, 0.16f, 1.0f};
+        TilePrototype light;
+        light.name  = "default_light";
+        light.color = Color{0.25f, 0.25f, 0.25f, 1.0f};
+
+        const TileId darkId  = m_registry.Add(std::move(dark));
+        const TileId lightId = m_registry.Add(std::move(light));
+        if (darkId != 0 && lightId != 0) {
+            m_world.params.tiles = {darkId, lightId};
+            m_world.pattern      = "checkerboard";
+        }
+    }
+
     m_registry.Freeze();
 
     const TileRenderData renderData = BuildTileRenderData(m_registry, m_baseDir);

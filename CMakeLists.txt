@@ -138,7 +138,7 @@ elseif(UNIX)
     set(ENGINE_GLSL_ARGS -V)
   endif()
 
-  add_custom_target(engine_shaders ALL
+  add_custom_target(engine_shaders
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:engine>/shaders"
     COMMAND ${ENGINE_GLSL_COMPILER} ${ENGINE_GLSL_ARGS}
             "${CMAKE_SOURCE_DIR}/shaders/quad.vert"
@@ -153,14 +153,15 @@ elseif(UNIX)
             "${CMAKE_SOURCE_DIR}/shaders/tile.frag"
             -o "$<TARGET_FILE_DIR:engine>/shaders/tile.frag.spv"
     COMMENT "Compiling GLSL shaders to SPIR-V")
-  add_dependencies(engine_shaders engine)
+  add_dependencies(engine engine_shaders)
 endif()
 
 # Ship runtime data next to the binary; the app resolves it through
-# SDL_GetBasePath() so it works from any launch directory. This runs on every
-# build rather than as a POST_BUILD step, so editing a script reaches the build
-# directory even when the binary itself does not need relinking.
-add_custom_target(engine_data ALL
+# SDL_GetBasePath() so it works from any launch directory. The engine target
+# DEPENDS on this (not the other way around) so that building or running
+# `engine` from an IDE always restages the data — and it runs on every build,
+# so editing a script reaches the build directory without relinking.
+add_custom_target(engine_data
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:engine>/config"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_SOURCE_DIR}/config/window.json"
@@ -169,4 +170,4 @@ add_custom_target(engine_data ALL
           "${CMAKE_SOURCE_DIR}/scripts"
           "$<TARGET_FILE_DIR:engine>/scripts"
   COMMENT "Staging runtime data next to executable")
-add_dependencies(engine_data engine)
+add_dependencies(engine engine_data)
