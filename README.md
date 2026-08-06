@@ -7,9 +7,9 @@ renderer abstraction whose backend is chosen per platform at compile time.
 
 | Platform | Backend     | Status |
 |----------|-------------|--------|
-| Windows  | Direct3D 12 | device init written, not yet CI-verified |
-| Linux    | Vulkan      | device init written, not yet CI-verified |
-| macOS    | Metal       | device init built and tested |
+| Windows  | Direct3D 12 | device init written, compile-checked in CI |
+| Linux    | Vulkan      | device init written, compile-checked in CI |
+| macOS    | Metal       | device init built and run-tested |
 
 ## Current boundary: no rendering yet
 
