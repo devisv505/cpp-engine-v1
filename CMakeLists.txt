@@ -16,6 +16,13 @@ endif()
 
 project(CppEngine VERSION 0.1.0 LANGUAGES CXX)
 
+# OBJCXX must be enabled before SDL is added as a subdirectory (FetchContent
+# path): SDL enables OBJC in its own scope, and enabling OBJCXX afterwards
+# fails at generate time with missing CMAKE_OBJCXX_* internal variables.
+if(APPLE)
+  enable_language(OBJCXX)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -60,7 +67,6 @@ if(WIN32)
   target_compile_definitions(engine PRIVATE ENGINE_BACKEND_D3D12=1 NOMINMAX WIN32_LEAN_AND_MEAN)
   target_link_libraries(engine PRIVATE d3d12 dxgi dxguid)
 elseif(APPLE)
-  enable_language(OBJCXX)
   target_sources(engine PRIVATE src/renderer/metal/MetalRenderer.mm)
   set_source_files_properties(src/renderer/metal/MetalRenderer.mm
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
