@@ -42,6 +42,19 @@ struct QuadConstants {
     float padding[2];
 };
 
+// Per-light constants for the volumetric passes (48 bytes). Backends combine
+// these fields with camera and occlusion-mask bounds into their own padded
+// push/root-constant block, so this struct describes the light data only.
+struct LightDrawConstants {
+    float positionX, positionY;   // world pixels
+    float dirX, dirY;             // normalized beam direction
+    float color[4];               // rgb premultiplied by intensity, a unused
+    float distance;               // beam length in world pixels
+    float cosHalfAngle;           // cone half-angle, precomputed cosine
+    float softness;               // 0 hard edge .. 1 fully feathered
+    float mode;                   // 0 = cone, 1 = screen-space god rays
+};
+
 // Constants for the tile-map pass; same 64-byte cross-backend contract.
 // The tile shader runs as one fullscreen draw: each fragment computes which
 // world tile it covers from the camera, fetches the tile id from the id

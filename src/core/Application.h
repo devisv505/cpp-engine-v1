@@ -9,6 +9,7 @@
 #include "editor/EditorCamera.h"
 #include "renderer/IRenderer.h"
 #include "scripting/ScriptHost.h"
+#include "world/Environment.h"
 #include "world/TileMap.h"
 #include "world/TileRegistry.h"
 #include "world/WorldConfig.h"
@@ -41,11 +42,11 @@ private:
     Scene2D                    m_scene;
     ScriptHost                 m_scripts;
     std::unique_ptr<IRenderer> m_renderer;
-    std::string                m_baseDir;
 
     TileRegistry m_registry;
     TileMap      m_map;
     WorldConfig  m_world;
+    Environment  m_environment;
     EditorCamera m_camera;
 
     uint64_t m_lastFrameNs = 0;

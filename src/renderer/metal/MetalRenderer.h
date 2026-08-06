@@ -24,9 +24,17 @@ public:
     void UpdateTileRegion(int x, int y, int w, int h,
                           const uint16_t* tiles, int mapWidth) override;
     void DrawTileMap(const TileDrawConstants& constants) override;
+    void SetOccluders(const Wall* walls, int wallCount,
+                      float originX, float originY,
+                      float worldWidth, float worldHeight) override;
+    void DrawWalls(const Wall* walls, int wallCount) override;
+    void DrawLighting(const Light* lights, int lightCount,
+                      const TileDrawConstants& camera) override;
     const char* GetBackendName() const override { return "Metal"; }
 
 private:
+    bool CreateLightingPipelines();
+
     MetalState* m_state = nullptr;
 };
 

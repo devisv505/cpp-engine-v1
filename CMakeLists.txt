@@ -66,6 +66,7 @@ endif()
 add_executable(engine
   src/main.cpp
   src/core/Config.cpp
+  src/core/Paths.cpp
   src/core/Window.cpp
   src/core/Application.cpp
   src/scripting/ScriptHost.cpp
@@ -78,6 +79,10 @@ add_executable(engine
   src/renderer/RendererFactory.cpp)
 
 target_include_directories(engine PRIVATE src third_party)
+
+# Debug builds read scripts and shaders from the repository, so editing them
+# only requires relaunching the app. NDEBUG (release) ignores this.
+target_compile_definitions(engine PRIVATE ENGINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(engine PRIVATE SDL3::SDL3 lua)
 
 # Exactly one renderer backend is compiled per platform.
@@ -121,21 +126,18 @@ elseif(UNIX)
     set(ENGINE_GLSL_ARGS -V)
   endif()
 
+  # Every stage of every shader in shaders/ is compiled next to the binary.
   add_custom_target(engine_shaders
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:engine>/shaders"
-    COMMAND ${ENGINE_GLSL_COMPILER} ${ENGINE_GLSL_ARGS}
-            "${CMAKE_SOURCE_DIR}/shaders/quad.vert"
-            -o "$<TARGET_FILE_DIR:engine>/shaders/quad.vert.spv"
-    COMMAND ${ENGINE_GLSL_COMPILER} ${ENGINE_GLSL_ARGS}
-            "${CMAKE_SOURCE_DIR}/shaders/quad.frag"
-            -o "$<TARGET_FILE_DIR:engine>/shaders/quad.frag.spv"
-    COMMAND ${ENGINE_GLSL_COMPILER} ${ENGINE_GLSL_ARGS}
-            "${CMAKE_SOURCE_DIR}/shaders/tile.vert"
-            -o "$<TARGET_FILE_DIR:engine>/shaders/tile.vert.spv"
-    COMMAND ${ENGINE_GLSL_COMPILER} ${ENGINE_GLSL_ARGS}
-            "${CMAKE_SOURCE_DIR}/shaders/tile.frag"
-            -o "$<TARGET_FILE_DIR:engine>/shaders/tile.frag.spv"
     COMMENT "Compiling GLSL shaders to SPIR-V")
+  foreach(ENGINE_SHADER quad tile occluder light)
+    foreach(ENGINE_STAGE vert frag)
+      add_custom_command(TARGET engine_shaders POST_BUILD
+        COMMAND ${ENGINE_GLSL_COMPILER} ${ENGINE_GLSL_ARGS}
+                "${CMAKE_SOURCE_DIR}/shaders/glsl/${ENGINE_SHADER}.${ENGINE_STAGE}"
+                -o "$<TARGET_FILE_DIR:engine>/shaders/${ENGINE_SHADER}.${ENGINE_STAGE}.spv")
+    endforeach()
+  endforeach()
   add_dependencies(engine engine_shaders)
 endif()
 
@@ -152,5 +154,8 @@ add_custom_target(engine_data
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CMAKE_SOURCE_DIR}/scripts"
           "$<TARGET_FILE_DIR:engine>/scripts"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CMAKE_SOURCE_DIR}/shaders"
+          "$<TARGET_FILE_DIR:engine>/shaders"
   COMMENT "Staging runtime data next to executable")
 add_dependencies(engine engine_data)

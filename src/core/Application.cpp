@@ -5,25 +5,12 @@
 #include <SDL3/SDL.h>
 
 #include "core/Log.h"
+#include "core/Paths.h"
 #include "renderer/RendererFactory.h"
 #include "world/MapPatterns.h"
 #include "world/TileAtlas.h"
 
 namespace engine {
-
-namespace {
-
-// Runtime data sits next to the executable (CMake copies it there), so the app
-// finds it no matter which directory it is launched from.
-std::string BaseDir()
-{
-    if (const char* basePath = SDL_GetBasePath()) {
-        return basePath;
-    }
-    return "";
-}
-
-} // namespace
 
 int Application::Run()
 {
@@ -44,9 +31,9 @@ bool Application::Init()
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
         return false;
     }
-    m_baseDir = BaseDir();
+    
 
-    m_config = LoadWindowConfig(m_baseDir + "config/window.json");
+    m_config = LoadWindowConfig(ResolveDataPath("config/window.json"));
 
     m_renderer = CreateRenderer();
     LOG_INFO("Renderer backend: %s", m_renderer->GetBackendName());
@@ -71,7 +58,7 @@ bool Application::Init()
 
 bool Application::RebuildWorld()
 {
-    if (!m_scripts.RunFile(m_baseDir + "scripts/main.lua")) {
+    if (!m_scripts.RunFile(ResolveDataPath("scripts/main.lua"))) {
         LOG_WARN("Scene script failed; continuing with defaults");
     }
 
@@ -101,7 +88,7 @@ bool Application::RebuildWorld()
 
     m_registry.Freeze();
 
-    const TileRenderData renderData = BuildTileRenderData(m_registry, m_baseDir);
+    const TileRenderData renderData = BuildTileRenderData(m_registry);
 
     if (!m_map.Create(m_world.width, m_world.height)) {
         return false;
@@ -114,6 +101,17 @@ bool Application::RebuildWorld()
     }
     int x = 0, y = 0, w = 0, h = 0;
     m_map.TakeDirtyRegion(x, y, w, h);  // CreateTileResources uploaded everything
+
+    m_environment.Clear();
+    m_scripts.ReadEnvironment(m_environment, kTileSizePx);
+
+    // The occlusion mask is cached: rebuilt here when walls change, never per
+    // frame. It covers the whole map in world pixels.
+    m_renderer->SetOccluders(m_environment.walls.data(),
+                             static_cast<int>(m_environment.walls.size()),
+                             0.0f, 0.0f,
+                             m_map.Width() * kTileSizePx,
+                             m_map.Height() * kTileSizePx);
 
     m_camera.Configure(m_world.editor,
                        static_cast<int>(m_map.Width() * kTileSizePx),
@@ -243,6 +241,11 @@ void Application::RenderFrame()
 
     m_renderer->BeginFrame(m_scene.clearColor);
     m_renderer->DrawTileMap(constants);
+    m_renderer->DrawWalls(m_environment.walls.data(),
+                          static_cast<int>(m_environment.walls.size()));
+    m_renderer->DrawLighting(m_environment.lights.data(),
+                             static_cast<int>(m_environment.lights.size()),
+                             constants);
     for (const Quad& quad : m_scene.quads) {
         m_renderer->DrawQuad(quad);
     }

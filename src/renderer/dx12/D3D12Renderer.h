@@ -32,6 +32,11 @@ public:
                           int mapWidth) override;
     void DrawTileMap(const TileDrawConstants& constants) override;
 
+    void SetOccluders(const Wall* walls, int wallCount, float originX, float originY,
+                      float worldWidth, float worldHeight) override;
+    void DrawWalls(const Wall* walls, int wallCount) override;
+    void DrawLighting(const Light* lights, int lightCount,
+                      const TileDrawConstants& camera) override;
 
     const char* GetBackendName() const override { return "Direct3D 12"; }
 
@@ -46,14 +51,26 @@ private:
     static constexpr UINT kTileConstantCount =
         static_cast<UINT>(sizeof(TileDrawConstants) / sizeof(uint32_t));
 
+    // RTV heap: one descriptor per back buffer, plus one past them for the
+    // cached world-space occlusion mask.
+    static constexpr UINT kRtvHeapSize  = kFrameCount + 1;
+    static constexpr UINT kMaskRtvIndex = kFrameCount;
+
     // Shader-visible SRV heap: slots 0-2 hold the tile textures (ids, atlas,
-    // palette). Sized with headroom for future descriptors.
+    // palette), slot 3 the occlusion mask. Sized with headroom for future
+    // descriptors.
     static constexpr UINT kSrvHeapSize  = 64;
     static constexpr UINT kTileSrvCount = 3;
+    static constexpr UINT kMaskSrvSlot  = 3;
+
+    // Occlusion mask resolution: one texel per four world pixels, capped so a
+    // huge world cannot ask for an unreasonable render target.
+    static constexpr float kMaskWorldPxPerTexel = 4.0f;
+    static constexpr UINT  kMaskMaxTexels       = 2048;
 
     // What the command list currently has bound. Draw calls bind lazily so
-    // the tile and quad passes can interleave in any order.
-    enum class BoundPipeline { None, Quad, Tile };
+    // the tile, quad and light passes can interleave in any order.
+    enum class BoundPipeline { None, Quad, Tile, Light };
 
     bool CreateFactory();
     bool PickAdapter();
@@ -71,6 +88,8 @@ private:
     bool CreateTilePipelineState();
     bool CreateTexture2D(UINT width, UINT height, DXGI_FORMAT format,
                          Microsoft::WRL::ComPtr<ID3D12Resource>& texture);
+    bool CreateRenderTargetTexture(UINT width, UINT height, DXGI_FORMAT format,
+                                   Microsoft::WRL::ComPtr<ID3D12Resource>& texture);
     bool CreateUploadBuffer(UINT64 sizeBytes, Microsoft::WRL::ComPtr<ID3D12Resource>& buffer);
     void ReleaseTileTextures();
     void ReleaseTileUploadBuffers();
@@ -78,10 +97,21 @@ private:
     void BindQuadPipeline();
     void BindTilePipeline();
 
+    // Volumetric lighting. The occluder objects serve the cached mask build,
+    bool CreateOccluderRootSignature();
+    bool CreateOccluderPipelineState();
+    bool CreateLightRootSignature();
+    bool CreateLightPipelineState();
+    bool EnsureOccluderPipeline();
+    bool EnsureLightingPipelines();
+    void ReleaseOcclusionMask();
+    void BindLightPipeline();
+
     void ReleaseRenderTargets();
     void ApplyPendingResize();
     void SetFramebufferSize(UINT width, UINT height);
 
+    D3D12_CPU_DESCRIPTOR_HANDLE RtvCpuHandle(UINT slot) const;
     D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(UINT slot) const;
     D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(UINT slot) const;
 
@@ -119,6 +149,27 @@ private:
 
     std::vector<uint16_t> m_tileCpu;      // CPU copy of the full tile-id grid
 
+    // Volumetric lighting. The occlusion mask is a world-space R8 texture
+    // rebuilt only by SetOccluders; the light pass owns one root
+    // signature and differ only in pipeline state (additive vs alpha blend).
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_occluderRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_occluderPipelineState;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_lightRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_lightPipelineState;
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_occlusionMask;
+
+    // World rectangle the mask covers, in world pixels, and its resolution.
+    // The light shader needs both to map a world position to a mask UV.
+    float m_maskOriginX = 0.0f;
+    float m_maskOriginY = 0.0f;
+    float m_maskWorldW  = 0.0f;
+    float m_maskWorldH  = 0.0f;
+    UINT  m_maskWidth   = 0;
+    UINT  m_maskHeight  = 0;
+
+    // Camera of the last DrawTileMap: DrawWalls gets no camera of its own.
+    TileDrawConstants m_lastCamera{};
+
     HANDLE m_fenceEvent = nullptr;
     UINT64 m_fenceValue = 0;                 // last value signalled on the queue
     UINT64 m_fenceValues[kFrameCount] = {};  // per-frame value of its last submission
@@ -149,11 +200,14 @@ private:
 
     BoundPipeline m_boundPipeline = BoundPipeline::None;
 
-    bool m_vsync              = true;
-    bool m_tearingSupported   = false;
-    bool m_resizePending      = false;
-    bool m_frameActive        = false;  // BeginFrame succeeded and EndFrame has not run
-    bool m_tileResourcesReady = false;
+    bool m_vsync               = true;
+    bool m_tearingSupported    = false;
+    bool m_resizePending       = false;
+    bool m_frameActive         = false;  // BeginFrame succeeded and EndFrame has not run
+    bool m_tileResourcesReady  = false;
+    bool m_cameraValid         = false;  // m_lastCamera holds a real camera
+    bool m_maskReady           = false;  // mask texture, RTV and SRV are all live
+    bool m_lightingUnavailable = false;  // shader compile failed once; do not retry
 };
 
 } // namespace engine

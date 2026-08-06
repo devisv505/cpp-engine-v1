@@ -8,6 +8,8 @@ namespace engine {
 
 class Window;
 struct TileRenderData;
+struct Wall;
+struct Light;
 
 // 2D renderer abstraction. Exactly one backend implementation is compiled per
 // platform: Direct3D 12 on Windows, Vulkan on Linux, Metal on macOS.
@@ -56,6 +58,25 @@ public:
     // Draws the whole visible map as one fullscreen pass. Only valid between
     // BeginFrame/EndFrame and after CreateTileResources.
     virtual void DrawTileMap(const TileDrawConstants& constants) = 0;
+
+    // --- Volumetric lighting ---------------------------------------------
+    // Occluders are cached: this rebuilds the world-space occlusion mask that
+    // the light shaders raymarch against, and is called only when the wall set
+    // changes (not per frame). `originX/Y` and `worldWidth/Height` describe the
+    // world-pixel rectangle the mask covers.
+    virtual void SetOccluders(const Wall* walls, int wallCount,
+                              float originX, float originY,
+                              float worldWidth, float worldHeight) = 0;
+
+    // Draws walls as world-space quads, transformed by the camera constants
+    // already supplied through DrawTileMap. Valid between Begin/EndFrame.
+    virtual void DrawWalls(const Wall* walls, int wallCount) = 0;
+
+    // Accumulates every visible light over the scene. Backends cull lights
+    // against the viewport, run the cone raymarch and the god-ray pass, then
+    // blend the result additively. Valid between Begin/EndFrame.
+    virtual void DrawLighting(const Light* lights, int lightCount,
+                              const TileDrawConstants& camera) = 0;
 
     virtual const char* GetBackendName() const = 0;
 };
