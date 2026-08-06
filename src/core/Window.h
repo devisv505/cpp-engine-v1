@@ -23,6 +23,10 @@ public:
     SDL_Window* GetSDLWindow() const { return m_window; }
     const WindowConfig& GetConfig() const { return m_config; }
 
+    // Framebuffer size in pixels, which differs from the logical window size on
+    // HiDPI displays. This is what the renderer's viewport must use.
+    void GetPixelSize(int& width, int& height) const;
+
 private:
     SDL_Window*  m_window = nullptr;
     WindowConfig m_config;

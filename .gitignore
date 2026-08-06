@@ -13,5 +13,8 @@ compile_commands.json
 .idea/
 *.swp
 
+# Local agent instructions (not part of the repo)
+CLAUDE.md
+
 # macOS
 .DS_Store

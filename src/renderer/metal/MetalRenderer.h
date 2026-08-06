@@ -14,6 +14,16 @@ public:
 
     bool Init(Window& window) override;
     void Shutdown() override;
+    void BeginFrame(const Color& clearColor) override;
+    void DrawQuad(const Quad& quad) override;
+    void EndFrame() override;
+    void OnResize(int pixelWidth, int pixelHeight) override;
+    bool CreateTileResources(const TileRenderData& data,
+                             int mapWidth, int mapHeight,
+                             const uint16_t* tiles) override;
+    void UpdateTileRegion(int x, int y, int w, int h,
+                          const uint16_t* tiles, int mapWidth) override;
+    void DrawTileMap(const TileDrawConstants& constants) override;
     const char* GetBackendName() const override { return "Metal"; }
 
 private:
