@@ -5,6 +5,8 @@
 #include "core/Log.h"
 #include "core/Scene2D.h"
 #include "core/Window.h"
+#include "world/TileRegistry.h"
+#include "world/WorldConfig.h"
 
 namespace engine {
 
@@ -203,6 +205,199 @@ void ScriptHost::Shutdown()
         lua_close(m_L);
         m_L = nullptr;
     }
+}
+
+namespace {
+
+std::string FieldString(lua_State* L, int table, const char* name, const std::string& fallback)
+{
+    lua_getfield(L, table, name);
+    std::string value = fallback;
+    if (lua_isstring(L, -1)) {
+        value = lua_tostring(L, -1);
+    }
+    lua_pop(L, 1);
+    return value;
+}
+
+bool FieldBool(lua_State* L, int table, const char* name, bool fallback)
+{
+    lua_getfield(L, table, name);
+    const bool value = lua_isboolean(L, -1) ? lua_toboolean(L, -1) != 0 : fallback;
+    lua_pop(L, 1);
+    return value;
+}
+
+// Reads an optional color-table field ({r,g,b[,a]} or named keys).
+bool FieldColor(lua_State* L, int table, const char* name, Color& out)
+{
+    lua_getfield(L, table, name);
+    const bool present = lua_istable(L, -1);
+    if (present) {
+        out = ReadColorTable(L, lua_absindex(L, -1));
+    }
+    lua_pop(L, 1);
+    return present;
+}
+
+// Parses one entry of the global `tiles` array into the registry.
+void ParseTileEntry(lua_State* L, TileRegistry& registry, int index)
+{
+    if (!lua_istable(L, -1)) {
+        LOG_WARN("tiles[%d]: expected a table, skipping", index);
+        return;
+    }
+    const int entry = lua_absindex(L, -1);
+
+    TilePrototype tile;
+    tile.name = FieldString(L, entry, "name", "");
+    if (tile.name.empty()) {
+        LOG_WARN("tiles[%d]: missing 'name', skipping", index);
+        return;
+    }
+
+    Color color;
+    const bool hasColor = FieldColor(L, entry, "color", color);
+    tile.texturePath    = FieldString(L, entry, "texture", "");
+    tile.walkable       = FieldBool(L, entry, "walkable", true);
+
+    if (!tile.texturePath.empty()) {
+        // Textured tiles tint with `tint` (or `color`); default is white.
+        Color tint{1.0f, 1.0f, 1.0f, 1.0f};
+        if (!FieldColor(L, entry, "tint", tint) && hasColor) {
+            tint = color;
+        }
+        tile.color = tint;
+    } else if (hasColor) {
+        tile.color = color;
+    } else {
+        LOG_WARN("tiles[%d] '%s': neither 'color' nor 'texture' given, using white",
+                 index, tile.name.c_str());
+        tile.color = Color{1.0f, 1.0f, 1.0f, 1.0f};
+    }
+
+    registry.Add(std::move(tile));
+}
+
+} // namespace
+
+bool ScriptHost::ReadWorldConfig(WorldConfig& config, TileRegistry& registry)
+{
+    if (!m_L) {
+        return false;
+    }
+
+    // Global `tiles`: explicit tile type definitions.
+    lua_getglobal(m_L, "tiles");
+    if (lua_istable(m_L, -1)) {
+        const lua_Integer count = luaL_len(m_L, -1);
+        for (lua_Integer i = 1; i <= count; ++i) {
+            lua_geti(m_L, -1, i);
+            ParseTileEntry(m_L, registry, static_cast<int>(i));
+            lua_pop(m_L, 1);
+        }
+    }
+    lua_pop(m_L, 1);
+
+    // Global `map`: pattern selection and parameters.
+    lua_getglobal(m_L, "map");
+    if (lua_istable(m_L, -1)) {
+        const int map = lua_absindex(m_L, -1);
+
+        config.pattern = FieldString(m_L, map, "pattern", config.pattern);
+        config.width   = static_cast<int>(FieldNumber(m_L, map, "width",
+                                                      static_cast<float>(config.width)));
+        config.height  = static_cast<int>(FieldNumber(m_L, map, "height",
+                                                      static_cast<float>(config.height)));
+        config.params.cellSize = static_cast<int>(FieldNumber(m_L, map, "cell_size", 1.0f));
+        config.params.seed     = static_cast<uint32_t>(FieldNumber(m_L, map, "seed", 0.0f));
+        FieldColor(m_L, map, "background", config.background);
+
+        // `tiles = {"a", "b"}`: participating tile types by name.
+        lua_getfield(m_L, map, "tiles");
+        if (lua_istable(m_L, -1)) {
+            const lua_Integer count = luaL_len(m_L, -1);
+            for (lua_Integer i = 1; i <= count; ++i) {
+                lua_geti(m_L, -1, i);
+                if (lua_isstring(m_L, -1)) {
+                    const char* name = lua_tostring(m_L, -1);
+                    const TileId id  = registry.FindByName(name);
+                    if (id == 0) {
+                        LOG_WARN("map.tiles[%d]: unknown tile '%s'", static_cast<int>(i), name);
+                    } else {
+                        config.params.tiles.push_back(id);
+                    }
+                }
+                lua_pop(m_L, 1);
+            }
+        }
+        lua_pop(m_L, 1);
+
+        // `colors = {{...}, {...}}` shorthand: auto-defines "color_N" types.
+        lua_getfield(m_L, map, "colors");
+        if (lua_istable(m_L, -1)) {
+            const lua_Integer count = luaL_len(m_L, -1);
+            for (lua_Integer i = 1; i <= count; ++i) {
+                lua_geti(m_L, -1, i);
+                if (lua_istable(m_L, -1)) {
+                    TilePrototype tile;
+                    tile.name  = "color_" + std::to_string(i);
+                    tile.color = ReadColorTable(m_L, lua_absindex(m_L, -1));
+                    TileId id  = registry.FindByName(tile.name);
+                    if (id == 0) {
+                        id = registry.Add(std::move(tile));
+                    }
+                    if (id != 0) {
+                        config.params.tiles.push_back(id);
+                    }
+                }
+                lua_pop(m_L, 1);
+            }
+        }
+        lua_pop(m_L, 1);
+
+        // `weights = {...}` for the random pattern.
+        lua_getfield(m_L, map, "weights");
+        if (lua_istable(m_L, -1)) {
+            const lua_Integer count = luaL_len(m_L, -1);
+            for (lua_Integer i = 1; i <= count; ++i) {
+                lua_geti(m_L, -1, i);
+                if (lua_isnumber(m_L, -1)) {
+                    config.params.weights.push_back(static_cast<float>(lua_tonumber(m_L, -1)));
+                }
+                lua_pop(m_L, 1);
+            }
+        }
+        lua_pop(m_L, 1);
+    }
+    lua_pop(m_L, 1);
+
+    // Global `editor`: camera configuration.
+    lua_getglobal(m_L, "editor");
+    if (lua_istable(m_L, -1)) {
+        const int editor = lua_absindex(m_L, -1);
+        config.editor.panSpeed = FieldNumber(m_L, editor, "pan_speed", config.editor.panSpeed);
+        config.editor.zoomMin  = FieldNumber(m_L, editor, "zoom_min", config.editor.zoomMin);
+        config.editor.zoomMax  = FieldNumber(m_L, editor, "zoom_max", config.editor.zoomMax);
+
+        lua_getfield(m_L, editor, "keys");
+        if (lua_istable(m_L, -1)) {
+            const int keys = lua_absindex(m_L, -1);
+            config.editor.keyUp    = FieldString(m_L, keys, "up", config.editor.keyUp);
+            config.editor.keyDown  = FieldString(m_L, keys, "down", config.editor.keyDown);
+            config.editor.keyLeft  = FieldString(m_L, keys, "left", config.editor.keyLeft);
+            config.editor.keyRight = FieldString(m_L, keys, "right", config.editor.keyRight);
+        }
+        lua_pop(m_L, 1);
+    }
+    lua_pop(m_L, 1);
+
+    if (config.params.tiles.empty()) {
+        LOG_WARN("Map config selects no tiles; the map will be void-filled");
+    }
+    LOG_INFO("World config: %dx%d pattern '%s', %u tile type(s) defined",
+             config.width, config.height, config.pattern.c_str(), registry.Count());
+    return true;
 }
 
 } // namespace engine

@@ -6,8 +6,14 @@
 #include "core/Config.h"
 #include "core/Scene2D.h"
 #include "core/Window.h"
+#include "editor/MapEditor.h"
 #include "renderer/IRenderer.h"
 #include "scripting/ScriptHost.h"
+#include "world/TileMap.h"
+#include "world/TileRegistry.h"
+#include "world/WorldConfig.h"
+
+union SDL_Event;
 
 namespace engine {
 
@@ -21,7 +27,10 @@ private:
     void MainLoop();
     void Shutdown();
 
-    void RunScript();
+    // Runs the script and rebuilds the world from its globals: tile registry,
+    // atlas, generated map, GPU tile resources, editor state.
+    bool RebuildWorld();
+    void HandleEvent(const SDL_Event& event, bool& running);
     void RenderFrame();
 
     WindowConfig               m_config;
@@ -29,11 +38,18 @@ private:
     Scene2D                    m_scene;
     ScriptHost                 m_scripts;
     std::unique_ptr<IRenderer> m_renderer;
-    std::string                m_scriptPath;
+    std::string                m_baseDir;
 
-    // Framebuffer size the current scene was built against.
-    int m_sceneWidth  = 0;
-    int m_sceneHeight = 0;
+    TileRegistry m_registry;
+    TileMap      m_map;
+    WorldConfig  m_world;
+    MapEditor    m_editor;
+
+    uint64_t m_lastFrameNs = 0;
+    bool     m_imguiReady  = false;
+
+    // Keyboard pan state (configurable keys, see EditorConfig).
+    bool m_panUp = false, m_panDown = false, m_panLeft = false, m_panRight = false;
 };
 
 } // namespace engine

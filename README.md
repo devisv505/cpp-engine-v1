@@ -2,8 +2,9 @@
 
 [![CI](https://github.com/devisv505/cpp-engine-v1/actions/workflows/ci.yml/badge.svg)](https://github.com/devisv505/cpp-engine-v1/actions/workflows/ci.yml)
 
-A cross-platform **2D engine** in C++20: SDL3 for windowing and events, a renderer
-abstraction with a native backend per platform, and **Lua** for defining content.
+A cross-platform **2D tile-map engine** in C++20: SDL3 for windowing and events, a
+renderer abstraction with a native backend per platform, **Lua** for defining content,
+and a built-in **Map Editor** (Dear ImGui) the engine boots into.
 
 | Platform | Backend     | Status |
 |----------|-------------|--------|
@@ -11,65 +12,86 @@ abstraction with a native backend per platform, and **Lua** for defining content
 | Linux    | Vulkan      | compile-checked in CI |
 | macOS    | Metal       | built and run-tested |
 
-The C++ side owns the window, the graphics device, the swapchain, and all drawing.
-Lua describes *what* to draw. The engine runs `scripts/main.lua` at startup; the script
-calls into a controlled `engine` API to set the clear color and add quads, and the
-renderer draws the result every frame.
+Factorio's division of labor: Lua defines tile types and picks how the map is
+generated; C++ owns generation, storage, rendering, editing, and everything
+performance-critical. The whole visible map renders as **one draw call** — a
+fullscreen pass reads a tile-id texture, so pan/zoom cost is independent of map
+size, and painting uploads only the dirty rectangle.
 
-## The Lua API
+## Map Editor
+
+The engine starts in the editor: a Lua-configured dark-grey checkerboard with a
+panel for picking tiles, painting, and managing maps.
+
+- **LMB** paint (brush size 1–32) · **RMB** eyedropper · **MMB** drag the map ·
+  **wheel** zoom centered on the cursor · **WASD** pan (configurable) · **F5**
+  re-run the script (regenerates the map) · **Esc** quit
+- New maps from any pattern + size; Save/Load to `maps/` next to the binary.
+  The binary format stores tile *names*, so maps survive tile-list reordering.
+- Editor and gameplay share the same map data and rendering path.
+
+## The Lua configuration
+
+`scripts/main.lua` runs once at startup (and on F5). It defines tile types and
+selects a generation pattern through plain globals:
 
 ```lua
-engine.log(message)
-engine.set_clear_color(r, g, b [, a])
-engine.add_quad{ x = , y = , w = , h = , color = {r, g, b [, a]} }
-engine.window_size() -> width, height   -- framebuffer pixels
-```
+tiles = {
+    { name = "slate", color = {0.35, 0.38, 0.42, 1.0} },                 -- solid color
+    { name = "sand",  texture = "textures/sand.png" },                   -- texture
+    { name = "moss",  texture = "textures/moss.png",
+      tint = {0.8, 1.0, 0.8, 1.0} },                                     -- texture x tint
+    { name = "water", color = {0.16, 0.32, 0.50, 1.0}, walkable = false },
+}
 
-Colors are floats in `0..1`. Coordinates are pixels with the origin at the **top-left**,
-+X right and +Y down. `color` accepts either `{0.9, 0.3, 0.2}` or `{r = 0.9, g = 0.3, b = 0.2}`.
+map = {
+    pattern = "checkerboard",          -- or "random", "solid" (implemented in C++)
+    colors = {                          -- shorthand: auto-defines tile types
+        { 0.16, 0.16, 0.16, 1.0 },
+        { 0.25, 0.25, 0.25, 1.0 }
+    },
+    -- or: tiles = {"slate", "moss"}, plus width, height, cell_size, seed, weights
+}
 
-A minimal scene:
-
-```lua
-engine.set_clear_color(0.09, 0.10, 0.13)
-
-local width, height = engine.window_size()
-engine.add_quad{
-    x = width * 0.25, y = height * 0.25,
-    w = width * 0.5,  h = height * 0.5,
-    color = { 0.20, 0.60, 0.86 },
+editor = {
+    pan_speed = 900, zoom_min = 0.125, zoom_max = 8.0,
+    keys = { up = "W", down = "S", left = "A", right = "D" },
 }
 ```
 
-Edit `scripts/main.lua` and press **F5** in the running engine to re-run it — the scene
-updates without a restart. Resizing the window also re-runs the script, so layouts
-expressed against `engine.window_size()` adapt. **Esc** quits.
+Lua never draws tiles, generates maps, or moves the camera — it only configures;
+the patterns and every per-tile operation run in C++. The immediate-mode quad API
+(`engine.set_clear_color`, `engine.add_quad{...}`, `engine.window_size`,
+`engine.log`) is still available for overlays.
 
 Scripts get a deliberately limited standard library (`base`, `string`, `table`, `math` —
-no `io`, `os`, or `package`), so the engine is reachable only through the `engine` table.
+no `io`, `os`, or `package`), so the engine is reachable only through its API.
 A script error is logged with a traceback and leaves the engine running.
 
 ## How drawing works
 
-Quads carry no vertex buffers. The vertex shader generates the four corners from the
-vertex index and a 64-byte per-draw constant block (`QuadConstants` in
-[`src/core/Scene2D.h`](src/core/Scene2D.h)), delivered as Metal vertex bytes, Vulkan push
-constants, or D3D12 root constants. A quad is therefore one constant upload plus a
-four-vertex triangle strip.
+The tile pass is a single fullscreen draw: each fragment computes its world tile
+from the camera constants, fetches the id from an `R16Uint` map texture, and
+resolves the tile's color or atlas texture (with tint) through a palette texture.
+Tile textures are packed into one atlas at load by `stb_image` + a shelf packer.
 
-The one asymmetry worth knowing: Metal and D3D12 clip space is Y-up, Vulkan's is Y-down,
-so the Vulkan shader omits the Y flip the other two apply.
+Quads carry no vertex buffers — the vertex shader generates corners from the
+vertex index and a 64-byte constant block ([`src/core/Scene2D.h`](src/core/Scene2D.h)),
+delivered as Metal vertex bytes, Vulkan push constants, or D3D12 root constants.
+One asymmetry worth knowing: Metal and D3D12 clip space is Y-up, Vulkan's is
+Y-down, so the Vulkan quad shader omits the Y flip the other two apply.
 
 ## Layout
 
 ```
 config/window.json        window settings (engine configuration)
-scripts/main.lua          scene definition (content)
-shaders/quad.{vert,frag}  GLSL sources, compiled to SPIR-V for the Vulkan backend
-third_party/nlohmann/     vendored JSON single header
-third_party/lua/          vendored Lua 5.5.1
+scripts/main.lua          world + editor configuration (content)
+shaders/                  GLSL sources, compiled to SPIR-V for the Vulkan backend
+third_party/              vendored Lua 5.5.1, Dear ImGui, nlohmann/json, stb_image
 src/core/                 Log, Config, Window, Scene2D, Application
 src/scripting/            ScriptHost — Lua VM, engine API bindings, error isolation
+src/world/                TileRegistry, TileMap, patterns, atlas builder, map IO
+src/editor/               EditorCamera (pan/zoom/drag), MapEditor (painting, panels)
 src/renderer/             IRenderer interface + compile-time backend factory
 src/renderer/{dx12,vulkan,metal}/   one backend, compiled only on its platform
 ```

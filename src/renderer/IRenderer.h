@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstdint>
+
 #include "core/Scene2D.h"
 
 namespace engine {
 
 class Window;
+struct TileRenderData;
 
 // 2D renderer abstraction. Exactly one backend implementation is compiled per
 // platform: Direct3D 12 on Windows, Vulkan on Linux, Metal on macOS.
@@ -35,6 +38,36 @@ public:
 
     // Framebuffer size changed (window resize, display scale change).
     virtual void OnResize(int pixelWidth, int pixelHeight) = 0;
+
+    // --- Tile map ---------------------------------------------------------
+    // Uploads the atlas + palette (TileRenderData, see world/TileAtlas.h) and
+    // the full tile-id grid (R16Uint texture, mapWidth x mapHeight). Callable
+    // again with new data (map regenerated or resized): implementations must
+    // replace the previous resources after waiting for the GPU.
+    virtual bool CreateTileResources(const TileRenderData& data,
+                                     int mapWidth, int mapHeight,
+                                     const uint16_t* tiles) = 0;
+
+    // Re-uploads the given tile rectangle. `tiles` is the FULL map array
+    // (row-major, mapWidth wide); implementations read the region from it.
+    virtual void UpdateTileRegion(int x, int y, int w, int h,
+                                  const uint16_t* tiles, int mapWidth) = 0;
+
+    // Draws the whole visible map as one fullscreen pass. Only valid between
+    // BeginFrame/EndFrame and after CreateTileResources.
+    virtual void DrawTileMap(const TileDrawConstants& constants) = 0;
+
+    // --- Dear ImGui -------------------------------------------------------
+    // InitImGui runs the SDL3 platform init (ImGui_ImplSDL3_InitFor*) and the
+    // graphics-backend init. The application owns the ImGui context and calls
+    // ImGui_ImplSDL3_NewFrame/ImGui::NewFrame itself; BeginImGuiFrame is the
+    // backend half (Metal needs the frame's render-pass descriptor, so call it
+    // between BeginFrame and RenderImGui). RenderImGui draws the current
+    // ImGui::GetDrawData into the frame being recorded.
+    virtual bool InitImGui(Window& window) = 0;
+    virtual void BeginImGuiFrame() = 0;
+    virtual void RenderImGui() = 0;
+    virtual void ShutdownImGui() = 0;
 
     virtual const char* GetBackendName() const = 0;
 };

@@ -42,4 +42,18 @@ struct QuadConstants {
     float padding[2];
 };
 
+// Constants for the tile-map pass; same 64-byte cross-backend contract.
+// The tile shader runs as one fullscreen draw: each fragment computes which
+// world tile it covers from the camera, fetches the tile id from the id
+// texture, and resolves color/texture through the palette texture.
+struct TileDrawConstants {
+    float cameraX, cameraY;        // world position (in world pixels) at viewport center
+    float zoom;                    // screen pixels per world pixel
+    float tileSizePx;              // world pixels per tile
+    float viewportW, viewportH;    // framebuffer size in pixels
+    float mapWidth, mapHeight;     // map size in tiles
+    float background[4];           // color outside the map bounds
+    float padding[4];
+};
+
 } // namespace engine

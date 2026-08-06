@@ -1,6 +1,7 @@
 #include "renderer/dx12/D3D12Renderer.h"
 
 #include <climits>
+#include <cstring>
 #include <string>
 
 #include <d3d12sdklayers.h>
@@ -9,8 +10,14 @@
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_video.h>
 
+#include <imgui.h>
+#include <imgui_impl_dx12.h>
+#include <imgui_impl_sdl3.h>
+
 #include "core/Log.h"
 #include "core/Window.h"
+#include "world/TileAtlas.h"
+#include "world/TileRegistry.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -56,6 +63,82 @@ float4 PSMain(VSOutput input) : SV_Target
 }
 )";
 
+// Fullscreen tile pass: each fragment finds the world tile it covers from the
+// camera constants, reads the tile id (t0), and resolves the final color
+// through the palette (t2) and atlas (t1). The cbuffer mirrors
+// TileDrawConstants field for field.
+constexpr char kTileShaderSource[] = R"(
+cbuffer TileConstants : register(b0)
+{
+    float2 camera;      // world pixels at the viewport center
+    float  zoom;        // screen pixels per world pixel
+    float  tileSizePx;  // world pixels per tile
+    float2 viewport;    // framebuffer size in pixels
+    float2 mapSize;     // map size in tiles
+    float4 background;  // color outside the map bounds
+    float4 padding;
+};
+
+Texture2D<uint>   tileIds    : register(t0);
+Texture2D         atlas      : register(t1);
+Texture2D<float4> palette    : register(t2);
+SamplerState      pointClamp : register(s0);
+
+struct VSOutput
+{
+    float4 position : SV_Position;
+};
+
+VSOutput VSMain(uint vertexId : SV_VertexID)
+{
+    // One triangle that covers the whole viewport.
+    const float2 corners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+
+    VSOutput output;
+    output.position = float4(corners[vertexId], 0.0, 1.0);
+    return output;
+}
+
+float4 PSMain(VSOutput input) : SV_Target
+{
+    // SV_Position arrives as top-left-origin pixel coordinates with +Y down,
+    // which matches world space, so there are no axis flips anywhere.
+    float2 worldPx = camera + (input.position.xy - viewport * 0.5) / zoom;
+    float2 tilePos = floor(worldPx / tileSizePx);
+
+    if (any(tilePos < 0.0) || any(tilePos >= mapSize)) {
+        return background;
+    }
+
+    uint   id       = min(tileIds.Load(int3(int2(tilePos), 0)), 255u);
+    float4 colorRow = palette.Load(int3(int(id), 0, 0));  // rgb + has-texture flag
+    float4 uvRow    = palette.Load(int3(int(id), 1, 0));  // atlas UV rect
+
+    float3 result = colorRow.rgb;
+    if (colorRow.a > 0.5) {
+        float2 f  = frac(worldPx / tileSizePx);
+        float2 uv = lerp(uvRow.xy, uvRow.zw, f);
+        result = atlas.Sample(pointClamp, uv).rgb * colorRow.rgb;
+    }
+    return float4(result, 1.0);
+}
+)";
+
+// The tile cbuffer above is written against this exact size; a change to
+// TileDrawConstants must update the shader too.
+static_assert(sizeof(TileDrawConstants) == 16 * sizeof(uint32_t),
+              "TileDrawConstants must stay 16 root constants");
+
+constexpr UINT AlignUp(UINT value, UINT alignment)
+{
+    return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+constexpr UINT64 AlignUp64(UINT64 value, UINT64 alignment)
+{
+    return (value + alignment - 1ull) & ~(alignment - 1ull);
+}
+
 std::string ToUtf8(const wchar_t* wide)
 {
     const int size = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
@@ -67,7 +150,8 @@ std::string ToUtf8(const wchar_t* wide)
     return utf8;
 }
 
-bool CompileShader(const char* entryPoint, const char* target, ComPtr<ID3DBlob>& blob)
+bool CompileShader(const char* source, size_t sourceSize, const char* sourceName,
+                   const char* entryPoint, const char* target, ComPtr<ID3DBlob>& blob)
 {
     UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
 #ifndef NDEBUG
@@ -75,10 +159,11 @@ bool CompileShader(const char* entryPoint, const char* target, ComPtr<ID3DBlob>&
 #endif
 
     ComPtr<ID3DBlob> errors;
-    const HRESULT hr = D3DCompile(kQuadShaderSource, sizeof(kQuadShaderSource) - 1, "quad.hlsl",
-                                  nullptr, nullptr, entryPoint, target, flags, 0, &blob, &errors);
+    const HRESULT hr = D3DCompile(source, sourceSize, sourceName, nullptr, nullptr, entryPoint,
+                                  target, flags, 0, &blob, &errors);
     if (FAILED(hr)) {
-        LOG_ERROR("[D3D12] %s compilation failed (0x%08X): %s", target, static_cast<unsigned>(hr),
+        LOG_ERROR("[D3D12] %s %s compilation failed (0x%08X): %s", sourceName, target,
+                  static_cast<unsigned>(hr),
                   errors ? static_cast<const char*>(errors->GetBufferPointer())
                          : "(no diagnostics)");
         return false;
@@ -316,10 +401,12 @@ bool D3D12Renderer::CreatePipelineState()
 {
     ComPtr<ID3DBlob> vertexShader;
     ComPtr<ID3DBlob> pixelShader;
-    if (!CompileShader("VSMain", "vs_5_1", vertexShader)) {
+    if (!CompileShader(kQuadShaderSource, sizeof(kQuadShaderSource) - 1, "quad.hlsl", "VSMain",
+                       "vs_5_1", vertexShader)) {
         return false;
     }
-    if (!CompileShader("PSMain", "ps_5_1", pixelShader)) {
+    if (!CompileShader(kQuadShaderSource, sizeof(kQuadShaderSource) - 1, "quad.hlsl", "PSMain",
+                       "ps_5_1", pixelShader)) {
         return false;
     }
 
@@ -442,11 +529,16 @@ void D3D12Renderer::BeginFrame(const Color& clearColor)
         LOG_ERROR("[D3D12] Command allocator reset failed");
         return;
     }
-    if (FAILED(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(),
-                                    m_pipelineState.Get()))) {
+    // Pipelines are bound lazily per draw path (quad / tile / ImGui), so the
+    // list starts without one.
+    if (FAILED(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr))) {
         LOG_ERROR("[D3D12] Command list reset failed");
         return;
     }
+
+    // This frame's fence has been waited on, so its upload buffer is idle and
+    // pending tile edits can be copied before any draw reads the texture.
+    FlushPendingTileUpload();
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -464,19 +556,28 @@ void D3D12Renderer::BeginFrame(const Color& clearColor)
     const float clear[4] = {clearColor.r, clearColor.g, clearColor.b, clearColor.a};
     m_commandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
 
-    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
-    m_commandList->SetPipelineState(m_pipelineState.Get());
     m_commandList->RSSetViewports(1, &m_viewport);
     m_commandList->RSSetScissorRects(1, &m_scissor);
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-    m_frameActive = true;
+    m_boundPipeline = BoundPipeline::None;
+    m_frameActive   = true;
+}
+
+void D3D12Renderer::BindQuadPipeline()
+{
+    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+    m_commandList->SetPipelineState(m_pipelineState.Get());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    m_boundPipeline = BoundPipeline::Quad;
 }
 
 void D3D12Renderer::DrawQuad(const Quad& quad)
 {
     if (!m_frameActive) {
         return;
+    }
+    if (m_boundPipeline != BoundPipeline::Quad) {
+        BindQuadPipeline();
     }
 
     QuadConstants constants{};
@@ -640,8 +741,723 @@ void D3D12Renderer::ReleaseRenderTargets()
     }
 }
 
+// --- Tile map ---------------------------------------------------------------
+
+bool D3D12Renderer::CreateSrvHeap()
+{
+    if (m_srvHeap) {
+        return true;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.NumDescriptors = kSrvHeapSize;
+    desc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    desc.NodeMask       = 0;
+
+    if (FAILED(m_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_srvHeap)))) {
+        LOG_ERROR("[D3D12] CreateDescriptorHeap(SRV) failed");
+        return false;
+    }
+    m_srvDescriptorSize =
+        m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // Slots above the tile textures belong to ImGui. Filled back to front so
+    // allocation (pop_back) hands out ascending slot numbers.
+    m_srvFreeSlots.clear();
+    m_srvFreeSlots.reserve(kSrvHeapSize - kTileSrvCount);
+    for (UINT slot = kSrvHeapSize; slot-- > kTileSrvCount;) {
+        m_srvFreeSlots.push_back(slot);
+    }
+    return true;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE D3D12Renderer::SrvCpuHandle(UINT slot) const
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(slot) * static_cast<SIZE_T>(m_srvDescriptorSize);
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE D3D12Renderer::SrvGpuHandle(UINT slot) const
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<UINT64>(slot) * static_cast<UINT64>(m_srvDescriptorSize);
+    return handle;
+}
+
+bool D3D12Renderer::CreateTexture2D(UINT width, UINT height, DXGI_FORMAT format,
+                                    ComPtr<ID3D12Resource>& texture)
+{
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type                 = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    heap.CreationNodeMask     = 0;
+    heap.VisibleNodeMask      = 0;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Alignment          = 0;
+    desc.Width              = width;
+    desc.Height             = height;
+    desc.DepthOrArraySize   = 1;
+    desc.MipLevels          = 1;
+    desc.Format             = format;
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+
+    if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&texture)))) {
+        LOG_ERROR("[D3D12] CreateCommittedResource(texture %ux%u) failed", width, height);
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateUploadBuffer(UINT64 sizeBytes, ComPtr<ID3D12Resource>& buffer)
+{
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type                 = D3D12_HEAP_TYPE_UPLOAD;
+    heap.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    heap.CreationNodeMask     = 0;
+    heap.VisibleNodeMask      = 0;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment          = 0;
+    desc.Width              = sizeBytes;
+    desc.Height             = 1;
+    desc.DepthOrArraySize   = 1;
+    desc.MipLevels          = 1;
+    desc.Format             = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+
+    if (FAILED(m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                 IID_PPV_ARGS(&buffer)))) {
+        LOG_ERROR("[D3D12] CreateCommittedResource(upload buffer, %llu bytes) failed",
+                  static_cast<unsigned long long>(sizeBytes));
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateTileRootSignature()
+{
+    // Param 0: TileDrawConstants as root constants at b0. Param 1: the three
+    // tile textures (t0-t2) as one descriptor table, plus a point-clamp
+    // static sampler at s0.
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors                    = kTileSrvCount;
+    range.BaseShaderRegister                = 0;
+    range.RegisterSpace                     = 0;
+    range.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.ShaderRegister = 0;
+    params[0].Constants.RegisterSpace  = 0;
+    params[0].Constants.Num32BitValues = kTileConstantCount;
+    params[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges   = &range;
+    params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter           = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MipLODBias       = 0.0f;
+    sampler.MaxAnisotropy    = 1;
+    sampler.ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.BorderColor      = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    sampler.MinLOD           = 0.0f;
+    sampler.MaxLOD           = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister   = 0;
+    sampler.RegisterSpace    = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters     = 2;
+    desc.pParameters       = params;
+    desc.NumStaticSamplers = 1;
+    desc.pStaticSamplers   = &sampler;
+    desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> serialized;
+    ComPtr<ID3DBlob> errors;
+    if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized,
+                                           &errors))) {
+        LOG_ERROR("[D3D12] Tile root signature serialization failed: %s",
+                  errors ? static_cast<const char*>(errors->GetBufferPointer())
+                         : "(no diagnostics)");
+        return false;
+    }
+
+    if (FAILED(m_device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                                             serialized->GetBufferSize(),
+                                             IID_PPV_ARGS(&m_tileRootSignature)))) {
+        LOG_ERROR("[D3D12] Tile CreateRootSignature failed");
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateTilePipelineState()
+{
+    ComPtr<ID3DBlob> vertexShader;
+    ComPtr<ID3DBlob> pixelShader;
+    if (!CompileShader(kTileShaderSource, sizeof(kTileShaderSource) - 1, "tile.hlsl", "VSMain",
+                       "vs_5_1", vertexShader)) {
+        return false;
+    }
+    if (!CompileShader(kTileShaderSource, sizeof(kTileShaderSource) - 1, "tile.hlsl", "PSMain",
+                       "ps_5_1", pixelShader)) {
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = m_tileRootSignature.Get();
+
+    desc.VS.pShaderBytecode = vertexShader->GetBufferPointer();
+    desc.VS.BytecodeLength  = vertexShader->GetBufferSize();
+    desc.PS.pShaderBytecode = pixelShader->GetBufferPointer();
+    desc.PS.BytecodeLength  = pixelShader->GetBufferSize();
+
+    desc.BlendState.AlphaToCoverageEnable  = FALSE;
+    desc.BlendState.IndependentBlendEnable = FALSE;
+
+    // Opaque fullscreen pass: every pixel is written, so no blending.
+    D3D12_RENDER_TARGET_BLEND_DESC& blend = desc.BlendState.RenderTarget[0];
+    blend.BlendEnable           = FALSE;
+    blend.LogicOpEnable         = FALSE;
+    blend.SrcBlend              = D3D12_BLEND_ONE;
+    blend.DestBlend             = D3D12_BLEND_ZERO;
+    blend.BlendOp               = D3D12_BLEND_OP_ADD;
+    blend.SrcBlendAlpha         = D3D12_BLEND_ONE;
+    blend.DestBlendAlpha        = D3D12_BLEND_ZERO;
+    blend.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+    blend.LogicOp               = D3D12_LOGIC_OP_NOOP;
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    desc.SampleMask = UINT_MAX;
+
+    desc.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.FrontCounterClockwise = FALSE;
+    desc.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+    desc.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    desc.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    desc.RasterizerState.DepthClipEnable       = TRUE;
+    desc.RasterizerState.MultisampleEnable     = FALSE;
+    desc.RasterizerState.AntialiasedLineEnable = FALSE;
+    desc.RasterizerState.ForcedSampleCount     = 0;
+    desc.RasterizerState.ConservativeRaster    = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    desc.DepthStencilState.DepthEnable   = FALSE;
+    desc.DepthStencilState.StencilEnable = FALSE;
+
+    desc.InputLayout.pInputElementDescs = nullptr;
+    desc.InputLayout.NumElements        = 0;
+    desc.PrimitiveTopologyType          = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets               = 1;
+    desc.RTVFormats[0]                  = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.DSVFormat                      = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count               = 1;
+    desc.SampleDesc.Quality             = 0;
+    desc.NodeMask                       = 0;
+    desc.Flags                          = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    if (FAILED(m_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_tilePipelineState)))) {
+        LOG_ERROR("[D3D12] Tile CreateGraphicsPipelineState failed");
+        return false;
+    }
+    return true;
+}
+
+bool D3D12Renderer::CreateTileResources(const TileRenderData& data, int mapWidth, int mapHeight,
+                                        const uint16_t* tiles)
+{
+    if (!m_device || !m_commandQueue || !m_commandList) {
+        LOG_ERROR("[D3D12] CreateTileResources called before Init");
+        return false;
+    }
+    if (m_frameActive) {
+        LOG_ERROR("[D3D12] CreateTileResources must not run inside a frame");
+        return false;
+    }
+    if (mapWidth <= 0 || mapHeight <= 0 || !tiles) {
+        LOG_ERROR("[D3D12] CreateTileResources: invalid map (%dx%d)", mapWidth, mapHeight);
+        return false;
+    }
+    if (data.atlasWidth <= 0 || data.atlasHeight <= 0 ||
+        data.atlasPixels.size() < static_cast<size_t>(data.atlasWidth) *
+                                      static_cast<size_t>(data.atlasHeight) * 4u) {
+        LOG_ERROR("[D3D12] CreateTileResources: invalid atlas data");
+        return false;
+    }
+    if (data.palettePixels.size() < static_cast<size_t>(TileRegistry::kMaxTileTypes) * 2u * 4u) {
+        LOG_ERROR("[D3D12] CreateTileResources: invalid palette data");
+        return false;
+    }
+
+    // Callable again after a map regenerate/resize: the old textures may still
+    // be referenced by in-flight frames, so drain the GPU before replacing
+    // them. Their SRV heap slots (0-2) are simply rewritten below.
+    WaitForGpu();
+    m_tileResourcesReady = false;
+    m_tileUpdatePending  = false;
+    ReleaseTileTextures();
+    ReleaseTileUploadBuffers();
+
+    if (!CreateSrvHeap()) {
+        return false;
+    }
+    if (!m_tileRootSignature && !CreateTileRootSignature()) {
+        return false;
+    }
+    if (!m_tilePipelineState && !CreateTilePipelineState()) {
+        return false;
+    }
+
+    const UINT mapW     = static_cast<UINT>(mapWidth);
+    const UINT mapH     = static_cast<UINT>(mapHeight);
+    const UINT atlasW   = static_cast<UINT>(data.atlasWidth);
+    const UINT atlasH   = static_cast<UINT>(data.atlasHeight);
+    const UINT paletteW = TileRegistry::kMaxTileTypes;
+    const UINT paletteH = 2;
+
+    if (!CreateTexture2D(mapW, mapH, DXGI_FORMAT_R16_UINT, m_tileIdTexture) ||
+        !CreateTexture2D(atlasW, atlasH, DXGI_FORMAT_R8G8B8A8_UNORM, m_atlasTexture) ||
+        !CreateTexture2D(paletteW, paletteH, DXGI_FORMAT_R32G32B32A32_FLOAT, m_paletteTexture)) {
+        ReleaseTileTextures();
+        return false;
+    }
+
+    // All three subresources share one staging buffer. Rows are re-packed at
+    // 256-byte-aligned pitches and each footprint starts 512-byte aligned.
+    struct Upload {
+        ID3D12Resource* texture;
+        DXGI_FORMAT     format;
+        UINT            width, height;
+        UINT            rowBytes;  // tightly packed source row
+        const uint8_t*  source;
+        UINT64          offset;
+        UINT            rowPitch;
+    };
+
+    Upload uploads[3] = {
+        {m_tileIdTexture.Get(), DXGI_FORMAT_R16_UINT, mapW, mapH, mapW * 2u,
+         reinterpret_cast<const uint8_t*>(tiles), 0, 0},
+        {m_atlasTexture.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, atlasW, atlasH, atlasW * 4u,
+         data.atlasPixels.data(), 0, 0},
+        {m_paletteTexture.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT, paletteW, paletteH,
+         paletteW * 16u, reinterpret_cast<const uint8_t*>(data.palettePixels.data()), 0, 0},
+    };
+
+    UINT64 stagingSize = 0;
+    for (Upload& upload : uploads) {
+        upload.rowPitch = AlignUp(upload.rowBytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        stagingSize     = AlignUp64(stagingSize, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+        upload.offset   = stagingSize;
+        stagingSize += static_cast<UINT64>(upload.rowPitch) * upload.height;
+    }
+
+    ComPtr<ID3D12Resource> staging;
+    if (!CreateUploadBuffer(stagingSize, staging)) {
+        ReleaseTileTextures();
+        return false;
+    }
+
+    const D3D12_RANGE noRead{0, 0};
+    uint8_t*           mapped = nullptr;
+    if (FAILED(staging->Map(0, &noRead, reinterpret_cast<void**>(&mapped)))) {
+        LOG_ERROR("[D3D12] Tile staging buffer Map failed");
+        ReleaseTileTextures();
+        return false;
+    }
+    for (const Upload& upload : uploads) {
+        for (UINT row = 0; row < upload.height; ++row) {
+            std::memcpy(mapped + upload.offset + static_cast<UINT64>(row) * upload.rowPitch,
+                        upload.source + static_cast<size_t>(row) * upload.rowBytes,
+                        upload.rowBytes);
+        }
+    }
+    staging->Unmap(0, nullptr);
+
+    // One-shot upload: the GPU is idle (WaitForGpu above), so the current
+    // frame's allocator and the shared command list are free to reuse.
+    if (FAILED(m_commandAllocators[m_frameIndex]->Reset()) ||
+        FAILED(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr))) {
+        LOG_ERROR("[D3D12] Tile upload command list reset failed");
+        ReleaseTileTextures();
+        return false;
+    }
+
+    for (const Upload& upload : uploads) {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource        = upload.texture;
+        dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource                          = staging.Get();
+        src.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset             = upload.offset;
+        src.PlacedFootprint.Footprint.Format   = upload.format;
+        src.PlacedFootprint.Footprint.Width    = upload.width;
+        src.PlacedFootprint.Footprint.Height   = upload.height;
+        src.PlacedFootprint.Footprint.Depth    = 1;
+        src.PlacedFootprint.Footprint.RowPitch = upload.rowPitch;
+
+        m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    D3D12_RESOURCE_BARRIER barriers[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        barriers[i].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[i].Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        barriers[i].Transition.pResource   = uploads[i].texture;
+        barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[i].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    m_commandList->ResourceBarrier(3, barriers);
+
+    if (FAILED(m_commandList->Close())) {
+        LOG_ERROR("[D3D12] Tile upload command list Close failed");
+        ReleaseTileTextures();
+        return false;
+    }
+
+    ID3D12CommandList* lists[] = {m_commandList.Get()};
+    m_commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu();  // `staging` dies at end of scope; the copy must be done
+
+    // SRVs into heap slots 0-2; recreation just overwrites them.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MostDetailedMip     = 0;
+    srv.Texture2D.MipLevels           = 1;
+    srv.Texture2D.PlaneSlice          = 0;
+    srv.Texture2D.ResourceMinLODClamp = 0.0f;
+
+    srv.Format = DXGI_FORMAT_R16_UINT;
+    m_device->CreateShaderResourceView(m_tileIdTexture.Get(), &srv, SrvCpuHandle(0));
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    m_device->CreateShaderResourceView(m_atlasTexture.Get(), &srv, SrvCpuHandle(1));
+    srv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    m_device->CreateShaderResourceView(m_paletteTexture.Get(), &srv, SrvCpuHandle(2));
+
+    // Persistent per-frame upload buffers for region updates, sized for the
+    // whole map at aligned pitch and left mapped for their lifetime.
+    const UINT   updatePitch = AlignUp(mapW * 2u, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    const UINT64 updateSize  = static_cast<UINT64>(updatePitch) * mapH;
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        if (!CreateUploadBuffer(updateSize, m_tileUploadBuffers[i])) {
+            ReleaseTileTextures();
+            ReleaseTileUploadBuffers();
+            return false;
+        }
+        if (FAILED(m_tileUploadBuffers[i]->Map(
+                0, &noRead, reinterpret_cast<void**>(&m_tileUploadMapped[i])))) {
+            LOG_ERROR("[D3D12] Tile update buffer Map failed");
+            ReleaseTileTextures();
+            ReleaseTileUploadBuffers();
+            return false;
+        }
+    }
+
+    // CPU copy of the grid: UpdateTileRegion patches it, the BeginFrame flush
+    // reads from it (the caller's pointer is not retained).
+    m_tileCpu.assign(tiles, tiles + static_cast<size_t>(mapWidth) * mapHeight);
+
+    m_mapWidth           = mapWidth;
+    m_mapHeight          = mapHeight;
+    m_tileResourcesReady = true;
+
+    LOG_INFO("[D3D12] Tile resources created: %dx%d map, %dx%d atlas", mapWidth, mapHeight,
+             data.atlasWidth, data.atlasHeight);
+    return true;
+}
+
+void D3D12Renderer::UpdateTileRegion(int x, int y, int w, int h, const uint16_t* tiles,
+                                     int mapWidth)
+{
+    if (!m_tileResourcesReady || !tiles) {
+        return;
+    }
+    if (mapWidth != m_mapWidth) {
+        LOG_WARN("[D3D12] UpdateTileRegion stride %d does not match map width %d; ignored",
+                 mapWidth, m_mapWidth);
+        return;
+    }
+
+    // Clamp to the map, then patch the CPU copy and grow the dirty rect. No
+    // GPU work here: the next BeginFrame flushes on the frame's command list.
+    const int x0 = x < 0 ? 0 : x;
+    const int y0 = y < 0 ? 0 : y;
+    const int x1 = x + w > m_mapWidth ? m_mapWidth : x + w;
+    const int y1 = y + h > m_mapHeight ? m_mapHeight : y + h;
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+
+    for (int row = y0; row < y1; ++row) {
+        std::memcpy(&m_tileCpu[static_cast<size_t>(row) * m_mapWidth + x0],
+                    &tiles[static_cast<size_t>(row) * mapWidth + x0],
+                    static_cast<size_t>(x1 - x0) * sizeof(uint16_t));
+    }
+
+    if (!m_tileUpdatePending) {
+        m_dirtyX0 = x0;
+        m_dirtyY0 = y0;
+        m_dirtyX1 = x1;
+        m_dirtyY1 = y1;
+        m_tileUpdatePending = true;
+    } else {
+        if (x0 < m_dirtyX0) m_dirtyX0 = x0;
+        if (y0 < m_dirtyY0) m_dirtyY0 = y0;
+        if (x1 > m_dirtyX1) m_dirtyX1 = x1;
+        if (y1 > m_dirtyY1) m_dirtyY1 = y1;
+    }
+}
+
+void D3D12Renderer::FlushPendingTileUpload()
+{
+    if (!m_tileUpdatePending || !m_tileResourcesReady) {
+        return;
+    }
+    m_tileUpdatePending = false;
+
+    uint8_t*        mapped = m_tileUploadMapped[m_frameIndex];
+    ID3D12Resource* upload = m_tileUploadBuffers[m_frameIndex].Get();
+    if (!mapped || !upload) {
+        return;
+    }
+
+    // This frame's upload buffer is idle (its fence was waited on in
+    // BeginFrame), so the dirty rows can be re-packed at aligned pitch. The
+    // rect pitch is at most the full-map pitch the buffer was sized for.
+    const UINT w        = static_cast<UINT>(m_dirtyX1 - m_dirtyX0);
+    const UINT h        = static_cast<UINT>(m_dirtyY1 - m_dirtyY0);
+    const UINT rowBytes = w * static_cast<UINT>(sizeof(uint16_t));
+    const UINT rowPitch = AlignUp(rowBytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+
+    for (UINT row = 0; row < h; ++row) {
+        std::memcpy(mapped + static_cast<UINT64>(row) * rowPitch,
+                    &m_tileCpu[(static_cast<size_t>(m_dirtyY0) + row) * m_mapWidth + m_dirtyX0],
+                    rowBytes);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource   = m_tileIdTexture.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    m_commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource        = m_tileIdTexture.Get();
+    dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource                          = upload;
+    src.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset             = 0;
+    src.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R16_UINT;
+    src.PlacedFootprint.Footprint.Width    = w;
+    src.PlacedFootprint.Footprint.Height   = h;
+    src.PlacedFootprint.Footprint.Depth    = 1;
+    src.PlacedFootprint.Footprint.RowPitch = rowPitch;
+
+    m_commandList->CopyTextureRegion(&dst, static_cast<UINT>(m_dirtyX0),
+                                     static_cast<UINT>(m_dirtyY0), 0, &src, nullptr);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(1, &barrier);
+}
+
+void D3D12Renderer::BindTilePipeline()
+{
+    ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    m_commandList->SetGraphicsRootSignature(m_tileRootSignature.Get());
+    m_commandList->SetPipelineState(m_tilePipelineState.Get());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->SetGraphicsRootDescriptorTable(1, SrvGpuHandle(0));
+    m_boundPipeline = BoundPipeline::Tile;
+}
+
+void D3D12Renderer::DrawTileMap(const TileDrawConstants& constants)
+{
+    if (!m_frameActive || !m_tileResourcesReady || !m_tilePipelineState) {
+        return;
+    }
+    if (m_boundPipeline != BoundPipeline::Tile) {
+        BindTilePipeline();
+    }
+
+    m_commandList->SetGraphicsRoot32BitConstants(0, kTileConstantCount, &constants, 0);
+    m_commandList->DrawInstanced(3, 1, 0, 0);  // fullscreen triangle
+}
+
+void D3D12Renderer::ReleaseTileTextures()
+{
+    m_tileIdTexture.Reset();
+    m_atlasTexture.Reset();
+    m_paletteTexture.Reset();
+}
+
+void D3D12Renderer::ReleaseTileUploadBuffers()
+{
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        if (m_tileUploadBuffers[i] && m_tileUploadMapped[i]) {
+            m_tileUploadBuffers[i]->Unmap(0, nullptr);
+        }
+        m_tileUploadMapped[i] = nullptr;
+        m_tileUploadBuffers[i].Reset();
+    }
+}
+
+// --- Dear ImGui -------------------------------------------------------------
+
+void D3D12Renderer::ImGuiSrvAlloc(ImGui_ImplDX12_InitInfo* info,
+                                  D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
+                                  D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
+{
+    auto* self = static_cast<D3D12Renderer*>(info->UserData);
+    if (!self || !self->m_srvHeap || self->m_srvFreeSlots.empty()) {
+        LOG_ERROR("[D3D12] ImGui SRV descriptor request could not be served");
+        outCpu->ptr = 0;
+        outGpu->ptr = 0;
+        return;
+    }
+    const UINT slot = self->m_srvFreeSlots.back();
+    self->m_srvFreeSlots.pop_back();
+    *outCpu = self->SrvCpuHandle(slot);
+    *outGpu = self->SrvGpuHandle(slot);
+}
+
+void D3D12Renderer::ImGuiSrvFree(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                 D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+{
+    (void)gpu;
+    auto* self = static_cast<D3D12Renderer*>(info->UserData);
+    if (!self || !self->m_srvHeap || self->m_srvDescriptorSize == 0 || cpu.ptr == 0) {
+        return;
+    }
+    const SIZE_T base = self->m_srvHeap->GetCPUDescriptorHandleForHeapStart().ptr;
+    const UINT   slot = static_cast<UINT>((cpu.ptr - base) / self->m_srvDescriptorSize);
+    if (slot >= kTileSrvCount && slot < kSrvHeapSize) {
+        self->m_srvFreeSlots.push_back(slot);
+    }
+}
+
+bool D3D12Renderer::InitImGui(Window& window)
+{
+    if (m_imguiInitialized) {
+        return true;
+    }
+    if (!m_device || !m_commandQueue) {
+        LOG_ERROR("[D3D12] InitImGui called before Init");
+        return false;
+    }
+    // ImGui shares the tile SRV heap; create it here if the tile pass has not.
+    if (!CreateSrvHeap()) {
+        return false;
+    }
+
+    if (!ImGui_ImplSDL3_InitForD3D(window.GetSDLWindow())) {
+        LOG_ERROR("[D3D12] ImGui_ImplSDL3_InitForD3D failed");
+        return false;
+    }
+
+    ImGui_ImplDX12_InitInfo info;  // zero-initializes itself
+    info.Device               = m_device.Get();
+    info.CommandQueue         = m_commandQueue.Get();
+    info.NumFramesInFlight    = static_cast<int>(kFrameCount);
+    info.RTVFormat            = DXGI_FORMAT_R8G8B8A8_UNORM;
+    info.DSVFormat            = DXGI_FORMAT_UNKNOWN;
+    info.UserData             = this;
+    info.SrvDescriptorHeap    = m_srvHeap.Get();
+    info.SrvDescriptorAllocFn = &D3D12Renderer::ImGuiSrvAlloc;
+    info.SrvDescriptorFreeFn  = &D3D12Renderer::ImGuiSrvFree;
+
+    if (!ImGui_ImplDX12_Init(&info)) {
+        LOG_ERROR("[D3D12] ImGui_ImplDX12_Init failed");
+        ImGui_ImplSDL3_Shutdown();
+        return false;
+    }
+
+    m_imguiInitialized = true;
+    LOG_INFO("[D3D12] Dear ImGui initialized");
+    return true;
+}
+
+void D3D12Renderer::BeginImGuiFrame()
+{
+    if (!m_imguiInitialized) {
+        return;
+    }
+    ImGui_ImplDX12_NewFrame();
+}
+
+void D3D12Renderer::RenderImGui()
+{
+    if (!m_imguiInitialized || !m_frameActive || !m_srvHeap) {
+        return;
+    }
+    ImDrawData* drawData = ImGui::GetDrawData();
+    if (!drawData) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    ImGui_ImplDX12_RenderDrawData(drawData, m_commandList.Get());
+
+    // ImGui bound its own root signature, pipeline, and topology.
+    m_boundPipeline = BoundPipeline::None;
+}
+
+void D3D12Renderer::ShutdownImGui()
+{
+    if (!m_imguiInitialized) {
+        return;
+    }
+    m_imguiInitialized = false;
+
+    WaitForGpu();
+    ImGui_ImplDX12_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+}
+
 void D3D12Renderer::Shutdown()
 {
+    // Safety net if the application forgot; ShutdownImGui is idempotent and
+    // must run while the device still exists.
+    if (m_imguiInitialized) {
+        ShutdownImGui();
+    }
+
     WaitForGpu();
     m_frameActive = false;
 
@@ -649,6 +1465,18 @@ void D3D12Renderer::Shutdown()
         CloseHandle(m_fenceEvent);
         m_fenceEvent = nullptr;
     }
+
+    ReleaseTileTextures();
+    ReleaseTileUploadBuffers();
+    m_tilePipelineState.Reset();
+    m_tileRootSignature.Reset();
+    m_srvHeap.Reset();
+    m_srvFreeSlots.clear();
+    m_tileCpu.clear();
+    m_tileResourcesReady = false;
+    m_tileUpdatePending  = false;
+    m_mapWidth           = 0;
+    m_mapHeight          = 0;
 
     m_fence.Reset();
     m_commandList.Reset();

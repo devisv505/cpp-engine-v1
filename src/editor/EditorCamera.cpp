@@ -1,0 +1,101 @@
+#include "editor/EditorCamera.h"
+
+#include <algorithm>
+#include <cmath>
+
+#include <SDL3/SDL_keyboard.h>
+
+#include "core/Log.h"
+
+namespace engine {
+
+namespace {
+
+SDL_Keycode ResolveKey(const std::string& name, SDL_Keycode fallback)
+{
+    const SDL_Keycode key = SDL_GetKeyFromName(name.c_str());
+    if (key == SDLK_UNKNOWN) {
+        LOG_WARN("editor.keys: unknown key name '%s'", name.c_str());
+        return fallback;
+    }
+    return key;
+}
+
+} // namespace
+
+void EditorCamera::Configure(const EditorConfig& config, int mapWidthPx, int mapHeightPx)
+{
+    m_panSpeed = config.panSpeed;
+    m_zoomMin  = std::max(0.01f, config.zoomMin);
+    m_zoomMax  = std::max(m_zoomMin, config.zoomMax);
+    keyUp      = ResolveKey(config.keyUp, SDLK_W);
+    keyDown    = ResolveKey(config.keyDown, SDLK_S);
+    keyLeft    = ResolveKey(config.keyLeft, SDLK_A);
+    keyRight   = ResolveKey(config.keyRight, SDLK_D);
+
+    m_x = mapWidthPx * 0.5f;
+    m_y = mapHeightPx * 0.5f;
+    m_zoom = m_targetZoom = 1.0f;
+}
+
+void EditorCamera::ScreenToWorld(float sx, float sy, float& wx, float& wy) const
+{
+    wx = m_x + (sx - m_viewportW * 0.5f) / m_zoom;
+    wy = m_y + (sy - m_viewportH * 0.5f) / m_zoom;
+}
+
+void EditorCamera::OnMouseWheel(float wheelY, float mouseX, float mouseY)
+{
+    (void)mouseX;
+    (void)mouseY;
+    // Each wheel notch scales the target; the smoothing in Update re-anchors
+    // on the live cursor position every frame.
+    m_targetZoom = std::clamp(m_targetZoom * std::pow(1.25f, wheelY), m_zoomMin, m_zoomMax);
+}
+
+void EditorCamera::BeginDrag(float mouseX, float mouseY)
+{
+    m_dragging = true;
+    ScreenToWorld(mouseX, mouseY, m_dragWorldX, m_dragWorldY);
+}
+
+void EditorCamera::Update(float dt, float mouseX, float mouseY, int viewportW, int viewportH)
+{
+    m_viewportW = std::max(1, viewportW);
+    m_viewportH = std::max(1, viewportH);
+
+    // Keyboard pan moves at constant *screen* speed regardless of zoom.
+    if (m_panX != 0.0f || m_panY != 0.0f) {
+        const float length = std::sqrt(m_panX * m_panX + m_panY * m_panY);
+        m_x += (m_panX / length) * m_panSpeed / m_zoom * dt;
+        m_y += (m_panY / length) * m_panSpeed / m_zoom * dt;
+    }
+
+    // Exponential zoom smoothing anchored on the cursor: the world point under
+    // the mouse before the zoom step is put back under it afterwards.
+    if (std::fabs(m_targetZoom - m_zoom) > 1e-4f * m_zoom) {
+        float anchorX = 0.0f, anchorY = 0.0f;
+        ScreenToWorld(mouseX, mouseY, anchorX, anchorY);
+
+        const float rate = 1.0f - std::exp(-14.0f * dt);
+        m_zoom += (m_targetZoom - m_zoom) * rate;
+        m_zoom = std::clamp(m_zoom, m_zoomMin, m_zoomMax);
+
+        float afterX = 0.0f, afterY = 0.0f;
+        ScreenToWorld(mouseX, mouseY, afterX, afterY);
+        m_x += anchorX - afterX;
+        m_y += anchorY - afterY;
+    } else {
+        m_zoom = m_targetZoom;
+    }
+
+    // Middle-mouse drag: keep the grabbed world point pinned under the cursor.
+    if (m_dragging) {
+        float underX = 0.0f, underY = 0.0f;
+        ScreenToWorld(mouseX, mouseY, underX, underY);
+        m_x += m_dragWorldX - underX;
+        m_y += m_dragWorldY - underY;
+    }
+}
+
+} // namespace engine
