@@ -14,6 +14,10 @@ public:
 
     bool Init(Window& window) override;
     void Shutdown() override;
+    void BeginFrame(const Color& clearColor) override;
+    void DrawQuad(const Quad& quad) override;
+    void EndFrame() override;
+    void OnResize(int pixelWidth, int pixelHeight) override;
     const char* GetBackendName() const override { return "Metal"; }
 
 private:

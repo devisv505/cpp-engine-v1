@@ -1,7 +1,5 @@
 #include "core/Application.h"
 
-#include <string>
-
 #include <SDL3/SDL.h>
 
 #include "core/Log.h"
@@ -11,14 +9,14 @@ namespace engine {
 
 namespace {
 
-// The config lives next to the executable (POST_BUILD copy in CMake), so the
-// app finds it no matter which directory it is launched from.
-std::string ResolveConfigPath()
+// Runtime data sits next to the executable (CMake copies it there), so the app
+// finds it no matter which directory it is launched from.
+std::string ResolveDataPath(const char* relativePath)
 {
     if (const char* basePath = SDL_GetBasePath()) {
-        return std::string(basePath) + "config/window.json";
+        return std::string(basePath) + relativePath;
     }
-    return "config/window.json";
+    return relativePath;
 }
 
 } // namespace
@@ -43,7 +41,7 @@ bool Application::Init()
         return false;
     }
 
-    m_config = LoadWindowConfig(ResolveConfigPath());
+    m_config = LoadWindowConfig(ResolveDataPath("config/window.json"));
 
     m_renderer = CreateRenderer();
     LOG_INFO("Renderer backend: %s", m_renderer->GetBackendName());
@@ -57,7 +55,24 @@ bool Application::Init()
         return false;
     }
 
+    if (!m_scripts.Init(m_scene, m_window)) {
+        return false;
+    }
+
+    m_scriptPath = ResolveDataPath("scripts/main.lua");
+    RunScript();
+
     return true;
+}
+
+// Rebuilds the scene from the script. A failing script leaves the engine
+// running with an empty scene rather than taking it down.
+void Application::RunScript()
+{
+    m_window.GetPixelSize(m_sceneWidth, m_sceneHeight);
+    if (!m_scripts.RunFile(m_scriptPath)) {
+        LOG_WARN("Scene script failed; rendering an empty scene");
+    }
 }
 
 void Application::MainLoop()
@@ -66,24 +81,57 @@ void Application::MainLoop()
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT) {
+            switch (event.type) {
+            case SDL_EVENT_QUIT:
                 running = false;
-            } else if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
-                       event.window.windowID == SDL_GetWindowID(m_window.GetSDLWindow())) {
-                running = false;
+                break;
+
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                if (event.window.windowID == SDL_GetWindowID(m_window.GetSDLWindow())) {
+                    running = false;
+                }
+                break;
+
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                m_renderer->OnResize(event.window.data1, event.window.data2);
+                // Scripts lay out against the window size, so re-run on a real
+                // size change. SDL also emits this event at window creation,
+                // where the scene is already current.
+                if (event.window.data1 != m_sceneWidth || event.window.data2 != m_sceneHeight) {
+                    RunScript();
+                }
+                break;
+
+            case SDL_EVENT_KEY_DOWN:
+                if (event.key.key == SDLK_F5 && !event.key.repeat) {
+                    LOG_INFO("Reloading %s", m_scriptPath.c_str());
+                    RunScript();
+                } else if (event.key.key == SDLK_ESCAPE) {
+                    running = false;
+                }
+                break;
+
+            default:
+                break;
             }
         }
 
-        m_renderer->BeginFrame();
-        m_renderer->EndFrame();
-
-        // No swapchain to present against yet; don't busy-spin the CPU.
-        SDL_Delay(16);
+        RenderFrame();
     }
+}
+
+void Application::RenderFrame()
+{
+    m_renderer->BeginFrame(m_scene.clearColor);
+    for (const Quad& quad : m_scene.quads) {
+        m_renderer->DrawQuad(quad);
+    }
+    m_renderer->EndFrame();
 }
 
 void Application::Shutdown()
 {
+    m_scripts.Shutdown();
     if (m_renderer) {
         m_renderer->Shutdown();
         m_renderer.reset();

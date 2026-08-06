@@ -45,7 +45,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential pkg-config libvulkan-dev \
+            build-essential pkg-config libvulkan-dev glslang-tools \
             libasound2-dev libpulse-dev libx11-dev libxext-dev libxrandr-dev \
             libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
             libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev \
@@ -75,8 +75,13 @@ jobs:
           STAGE="cpp-engine-${VERSION}-${{ matrix.artifact }}"
           mkdir "$STAGE"
           cp "${{ matrix.bindir }}/engine${{ matrix.exe }}" "$STAGE/"
-          mkdir "$STAGE/config"
-          cp config/window.json "$STAGE/config/"
+          # Package the runtime data exactly as the build staged it next to the
+          # binary (config, scripts, and on Linux the compiled SPIR-V shaders).
+          for data in config scripts shaders; do
+            if [ -d "${{ matrix.bindir }}/$data" ]; then
+              cp -R "${{ matrix.bindir }}/$data" "$STAGE/"
+            fi
+          done
           cp README.md LICENSE "$STAGE/"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             7z a "$STAGE.zip" "$STAGE"

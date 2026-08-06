@@ -36,6 +36,15 @@ bool Window::Init(const WindowConfig& config, SDL_WindowFlags backendFlags)
     return true;
 }
 
+void Window::GetPixelSize(int& width, int& height) const
+{
+    width  = 0;
+    height = 0;
+    if (m_window) {
+        SDL_GetWindowSizeInPixels(m_window, &width, &height);
+    }
+}
+
 void Window::Shutdown()
 {
     if (m_window) {
