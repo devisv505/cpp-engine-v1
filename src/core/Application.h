@@ -6,7 +6,7 @@
 #include "core/Config.h"
 #include "core/Scene2D.h"
 #include "core/Window.h"
-#include "editor/MapEditor.h"
+#include "editor/EditorCamera.h"
 #include "renderer/IRenderer.h"
 #include "scripting/ScriptHost.h"
 #include "world/TileMap.h"
@@ -19,6 +19,9 @@ namespace engine {
 
 class Application {
 public:
+    // World pixels per tile. The camera and the tile shader share this scale.
+    static constexpr float kTileSizePx = 32.0f;
+
     // Runs init -> main loop -> shutdown. Returns the process exit code.
     int Run();
 
@@ -28,7 +31,7 @@ private:
     void Shutdown();
 
     // Runs the script and rebuilds the world from its globals: tile registry,
-    // atlas, generated map, GPU tile resources, editor state.
+    // atlas, generated map, GPU tile resources, camera.
     bool RebuildWorld();
     void HandleEvent(const SDL_Event& event, bool& running);
     void RenderFrame();
@@ -43,10 +46,9 @@ private:
     TileRegistry m_registry;
     TileMap      m_map;
     WorldConfig  m_world;
-    MapEditor    m_editor;
+    EditorCamera m_camera;
 
     uint64_t m_lastFrameNs = 0;
-    bool     m_imguiReady  = false;
 
     // Keyboard pan state (configurable keys, see EditorConfig).
     bool m_panUp = false, m_panDown = false, m_panLeft = false, m_panRight = false;

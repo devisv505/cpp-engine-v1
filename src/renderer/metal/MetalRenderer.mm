@@ -6,10 +6,6 @@
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_metal.h>
 
-#include <imgui.h>
-#include <imgui_impl_metal.h>
-#include <imgui_impl_sdl3.h>
-
 #include "core/Log.h"
 #include "core/Window.h"
 #include "world/TileAtlas.h"
@@ -129,13 +125,10 @@ struct MetalState {
     id<MTLTexture>             atlasTex     = nil;
     id<MTLTexture>             paletteTex   = nil;
 
-    bool imguiReady = false;
-
     // Valid only between BeginFrame and EndFrame.
     id<CAMetalDrawable>         drawable       = nil;
     id<MTLCommandBuffer>        commandBuffer  = nil;
     id<MTLRenderCommandEncoder> encoder        = nil;
-    MTLRenderPassDescriptor*    passDescriptor = nil;
     void*                       poolToken      = nullptr;
 
     float viewportWidth  = 0.0f;
@@ -276,7 +269,6 @@ void MetalRenderer::BeginFrame(const Color& clearColor)
 
     m_state->commandBuffer  = [m_state->queue commandBuffer];
     m_state->encoder        = [m_state->commandBuffer renderCommandEncoderWithDescriptor:pass];
-    m_state->passDescriptor = pass;  // ImGui's Metal backend needs it per frame
     [m_state->encoder setRenderPipelineState:m_state->pipeline];
 }
 
@@ -367,47 +359,6 @@ void MetalRenderer::DrawTileMap(const TileDrawConstants& constants)
     [m_state->encoder setRenderPipelineState:m_state->pipeline];
 }
 
-bool MetalRenderer::InitImGui(Window& window)
-{
-    if (!m_state || !m_state->device) {
-        return false;
-    }
-    if (!ImGui_ImplSDL3_InitForMetal(window.GetSDLWindow())) {
-        LOG_ERROR("[Metal] ImGui SDL3 init failed");
-        return false;
-    }
-    if (!ImGui_ImplMetal_Init(m_state->device)) {
-        LOG_ERROR("[Metal] ImGui Metal init failed");
-        ImGui_ImplSDL3_Shutdown();
-        return false;
-    }
-    m_state->imguiReady = true;
-    return true;
-}
-
-void MetalRenderer::BeginImGuiFrame()
-{
-    if (m_state && m_state->imguiReady && m_state->passDescriptor) {
-        ImGui_ImplMetal_NewFrame(m_state->passDescriptor);
-    }
-}
-
-void MetalRenderer::RenderImGui()
-{
-    if (m_state && m_state->imguiReady && m_state->encoder) {
-        ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(),
-                                       m_state->commandBuffer, m_state->encoder);
-    }
-}
-
-void MetalRenderer::ShutdownImGui()
-{
-    if (m_state && m_state->imguiReady) {
-        ImGui_ImplMetal_Shutdown();
-        ImGui_ImplSDL3_Shutdown();
-        m_state->imguiReady = false;
-    }
-}
 
 void MetalRenderer::DrawQuad(const Quad& quad)
 {
@@ -443,7 +394,6 @@ void MetalRenderer::EndFrame()
     m_state->encoder        = nil;
     m_state->commandBuffer  = nil;
     m_state->drawable       = nil;
-    m_state->passDescriptor = nil;
 
     objc_autoreleasePoolPop(m_state->poolToken);
     m_state->poolToken = nullptr;
@@ -458,7 +408,6 @@ void MetalRenderer::Shutdown()
         objc_autoreleasePoolPop(m_state->poolToken);
         m_state->poolToken = nullptr;
     }
-    ShutdownImGui();
     if (m_state->view) {
         SDL_Metal_DestroyView(m_state->view);
         m_state->view = nullptr;

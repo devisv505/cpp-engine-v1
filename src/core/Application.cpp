@@ -3,8 +3,6 @@
 #include <algorithm>
 
 #include <SDL3/SDL.h>
-#include <imgui.h>
-#include <imgui_impl_sdl3.h>
 
 #include "core/Log.h"
 #include "renderer/RendererFactory.h"
@@ -60,16 +58,6 @@ bool Application::Init()
         LOG_ERROR("Renderer initialization failed");
         return false;
     }
-
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGui::StyleColorsDark();
-    ImGui::GetIO().IniFilename = nullptr;  // no imgui.ini clutter next to the binary
-    if (!m_renderer->InitImGui(m_window)) {
-        return false;
-    }
-    m_imguiReady = true;
-
     if (!m_scripts.Init(m_scene, m_window)) {
         return false;
     }
@@ -93,7 +81,7 @@ bool Application::RebuildWorld()
 
     // A script that defines no usable tiles would generate an all-void (black)
     // map, which reads as a broken engine. Fall back to the default two-tone
-    // checkerboard so the editor always starts on something meaningful.
+    // checkerboard so the view always starts on something meaningful.
     if (m_world.params.tiles.empty()) {
         LOG_WARN("Script defined no map tiles; falling back to the default checkerboard");
         TilePrototype dark;
@@ -127,17 +115,15 @@ bool Application::RebuildWorld()
     int x = 0, y = 0, w = 0, h = 0;
     m_map.TakeDirtyRegion(x, y, w, h);  // CreateTileResources uploaded everything
 
-    m_editor.Init(m_map, m_registry, m_world, m_baseDir);
+    m_camera.Configure(m_world.editor,
+                       static_cast<int>(m_map.Width() * kTileSizePx),
+                       static_cast<int>(m_map.Height() * kTileSizePx));
     m_panUp = m_panDown = m_panLeft = m_panRight = false;
     return true;
 }
 
 void Application::HandleEvent(const SDL_Event& event, bool& running)
 {
-    ImGui_ImplSDL3_ProcessEvent(&event);
-    const ImGuiIO& io = ImGui::GetIO();
-    EditorCamera&  camera = m_editor.Camera();
-
     // Mouse coordinates arrive in window points; the camera works in
     // framebuffer pixels, so scale by the pixel density.
     int pixelW = 0, pixelH = 0, logicalW = 0, logicalH = 0;
@@ -161,28 +147,26 @@ void Application::HandleEvent(const SDL_Event& event, bool& running)
         break;
 
     case SDL_EVENT_MOUSE_WHEEL:
-        if (!io.WantCaptureMouse) {
-            camera.OnMouseWheel(event.wheel.y, event.wheel.mouse_x * scale,
-                                event.wheel.mouse_y * scale);
-        }
+        m_camera.OnMouseWheel(event.wheel.y, event.wheel.mouse_x * scale,
+                              event.wheel.mouse_y * scale);
         break;
 
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        if (!io.WantCaptureMouse && event.button.button == SDL_BUTTON_MIDDLE) {
-            camera.BeginDrag(event.button.x * scale, event.button.y * scale);
+        if (event.button.button == SDL_BUTTON_MIDDLE) {
+            m_camera.BeginDrag(event.button.x * scale, event.button.y * scale);
         }
         break;
 
     case SDL_EVENT_MOUSE_BUTTON_UP:
         if (event.button.button == SDL_BUTTON_MIDDLE) {
-            camera.EndDrag();
+            m_camera.EndDrag();
         }
         break;
 
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && !io.WantCaptureKeyboard) {
+        if (down) {
             if (event.key.key == SDLK_F5 && !event.key.repeat) {
                 LOG_INFO("Reloading script and regenerating the world");
                 RebuildWorld();
@@ -193,13 +177,10 @@ void Application::HandleEvent(const SDL_Event& event, bool& running)
                 return;
             }
         }
-        // Releases always clear; presses only register when ImGui does not
-        // own the keyboard (typing in a panel must not pan the camera).
-        const bool engage = down && !io.WantCaptureKeyboard;
-        if (event.key.key == camera.keyUp)    m_panUp    = engage;
-        if (event.key.key == camera.keyDown)  m_panDown  = engage;
-        if (event.key.key == camera.keyLeft)  m_panLeft  = engage;
-        if (event.key.key == camera.keyRight) m_panRight = engage;
+        if (event.key.key == m_camera.keyUp)    m_panUp    = down;
+        if (event.key.key == m_camera.keyDown)  m_panDown  = down;
+        if (event.key.key == m_camera.keyLeft)  m_panLeft  = down;
+        if (event.key.key == m_camera.keyRight) m_panRight = down;
         break;
     }
 
@@ -221,25 +202,16 @@ void Application::MainLoop()
         const float dt = std::min(0.1f, static_cast<float>(nowNs - m_lastFrameNs) * 1e-9f);
         m_lastFrameNs  = nowNs;
 
-        const ImGuiIO& io = ImGui::GetIO();
-        EditorCamera&  camera = m_editor.Camera();
-
         float mouseX = 0.0f, mouseY = 0.0f;
-        const uint32_t buttons = SDL_GetMouseState(&mouseX, &mouseY);
+        SDL_GetMouseState(&mouseX, &mouseY);
         int pixelW = 0, pixelH = 0, logicalW = 0, logicalH = 0;
         m_window.GetPixelSize(pixelW, pixelH);
         SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
         const float scale = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
-        const float mousePxX = mouseX * scale;
-        const float mousePxY = mouseY * scale;
 
-        camera.SetPanInput(static_cast<float>(m_panRight) - static_cast<float>(m_panLeft),
-                           static_cast<float>(m_panDown) - static_cast<float>(m_panUp));
-        camera.Update(dt, mousePxX, mousePxY, pixelW, pixelH);
-
-        if (!io.WantCaptureMouse) {
-            m_editor.UpdatePainting(mousePxX, mousePxY, buttons);
-        }
+        m_camera.SetPanInput(static_cast<float>(m_panRight) - static_cast<float>(m_panLeft),
+                             static_cast<float>(m_panDown) - static_cast<float>(m_panUp));
+        m_camera.Update(dt, mouseX * scale, mouseY * scale, pixelW, pixelH);
 
         int dx = 0, dy = 0, dw = 0, dh = 0;
         if (m_map.TakeDirtyRegion(dx, dy, dw, dh)) {
@@ -252,16 +224,14 @@ void Application::MainLoop()
 
 void Application::RenderFrame()
 {
-    const EditorCamera& camera = m_editor.Camera();
-
     int pixelW = 0, pixelH = 0;
     m_window.GetPixelSize(pixelW, pixelH);
 
     TileDrawConstants constants{};
-    constants.cameraX    = camera.X();
-    constants.cameraY    = camera.Y();
-    constants.zoom       = camera.Zoom();
-    constants.tileSizePx = MapEditor::kTileSizePx;
+    constants.cameraX    = m_camera.X();
+    constants.cameraY    = m_camera.Y();
+    constants.zoom       = m_camera.Zoom();
+    constants.tileSizePx = kTileSizePx;
     constants.viewportW  = static_cast<float>(pixelW);
     constants.viewportH  = static_cast<float>(pixelH);
     constants.mapWidth   = static_cast<float>(m_map.Width());
@@ -276,32 +246,11 @@ void Application::RenderFrame()
     for (const Quad& quad : m_scene.quads) {
         m_renderer->DrawQuad(quad);
     }
-
-    m_renderer->BeginImGuiFrame();
-    ImGui_ImplSDL3_NewFrame();
-    ImGui::NewFrame();
-    const bool mapRecreated = m_editor.BuildUI(camera);
-    ImGui::Render();
-    m_renderer->RenderImGui();
     m_renderer->EndFrame();
-
-    if (mapRecreated) {
-        // New size or freshly loaded contents: rebuild the GPU-side map.
-        const TileRenderData renderData = BuildTileRenderData(m_registry, m_baseDir);
-        m_renderer->CreateTileResources(renderData, m_map.Width(), m_map.Height(),
-                                        m_map.Data());
-        int x = 0, y = 0, w = 0, h = 0;
-        m_map.TakeDirtyRegion(x, y, w, h);
-    }
 }
 
 void Application::Shutdown()
 {
-    if (m_imguiReady) {
-        m_renderer->ShutdownImGui();
-        ImGui::DestroyContext();
-        m_imguiReady = false;
-    }
     m_scripts.Shutdown();
     if (m_renderer) {
         m_renderer->Shutdown();

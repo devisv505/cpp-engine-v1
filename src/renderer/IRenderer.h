@@ -57,18 +57,6 @@ public:
     // BeginFrame/EndFrame and after CreateTileResources.
     virtual void DrawTileMap(const TileDrawConstants& constants) = 0;
 
-    // --- Dear ImGui -------------------------------------------------------
-    // InitImGui runs the SDL3 platform init (ImGui_ImplSDL3_InitFor*) and the
-    // graphics-backend init. The application owns the ImGui context and calls
-    // ImGui_ImplSDL3_NewFrame/ImGui::NewFrame itself; BeginImGuiFrame is the
-    // backend half (Metal needs the frame's render-pass descriptor, so call it
-    // between BeginFrame and RenderImGui). RenderImGui draws the current
-    // ImGui::GetDrawData into the frame being recorded.
-    virtual bool InitImGui(Window& window) = 0;
-    virtual void BeginImGuiFrame() = 0;
-    virtual void RenderImGui() = 0;
-    virtual void ShutdownImGui() = 0;
-
     virtual const char* GetBackendName() const = 0;
 };
 

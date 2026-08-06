@@ -4,7 +4,7 @@
 
 A cross-platform **2D tile-map engine** in C++20: SDL3 for windowing and events, a
 renderer abstraction with a native backend per platform, **Lua** for defining content,
-and a built-in **Map Editor** (Dear ImGui) the engine boots into.
+rendering a tile map the engine boots into fullscreen.
 
 | Platform | Backend     | Status |
 |----------|-------------|--------|
@@ -18,17 +18,17 @@ performance-critical. The whole visible map renders as **one draw call** — a
 fullscreen pass reads a tile-id texture, so pan/zoom cost is independent of map
 size, and painting uploads only the dirty rectangle.
 
-## Map Editor
+## Controls
 
-The engine starts in the editor: a Lua-configured dark-grey checkerboard with a
-panel for picking tiles, painting, and managing maps.
+The engine starts fullscreen (set `fullscreen` in `config/window.json` to run
+windowed) showing the Lua-configured map.
 
-- **LMB** paint (brush size 1–32) · **RMB** eyedropper · **MMB** drag the map ·
-  **wheel** zoom centered on the cursor · **WASD** pan (configurable) · **F5**
-  re-run the script (regenerates the map) · **Esc** quit
-- New maps from any pattern + size; Save/Load to `maps/` next to the binary.
-  The binary format stores tile *names*, so maps survive tile-list reordering.
-- Editor and gameplay share the same map data and rendering path.
+- **MMB drag** move the map · **wheel** zoom centered on the cursor ·
+  **WASD** pan (configurable) · **F5** re-run the script and regenerate ·
+  **Esc** quit
+
+There is no UI layer yet — tile painting and map save/load exist in the engine
+(`src/world/MapIO.h`) but have no controls bound until a custom UI lands.
 
 ## The Lua configuration
 
@@ -87,11 +87,11 @@ Y-down, so the Vulkan quad shader omits the Y flip the other two apply.
 config/window.json        window settings (engine configuration)
 scripts/main.lua          world + editor configuration (content)
 shaders/                  GLSL sources, compiled to SPIR-V for the Vulkan backend
-third_party/              vendored Lua 5.5.1, Dear ImGui, nlohmann/json, stb_image
+third_party/              vendored Lua 5.5.1, nlohmann/json, stb_image
 src/core/                 Log, Config, Window, Scene2D, Application
 src/scripting/            ScriptHost — Lua VM, engine API bindings, error isolation
 src/world/                TileRegistry, TileMap, patterns, atlas builder, map IO
-src/editor/               EditorCamera (pan/zoom/drag), MapEditor (painting, panels)
+src/editor/               EditorCamera (pan, zoom, drag)
 src/renderer/             IRenderer interface + compile-time backend factory
 src/renderer/{dx12,vulkan,metal}/   one backend, compiled only on its platform
 ```

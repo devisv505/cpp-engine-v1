@@ -10,9 +10,6 @@
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_video.h>
 
-#include <imgui.h>
-#include <imgui_impl_dx12.h>
-#include <imgui_impl_sdl3.h>
 
 #include "core/Log.h"
 #include "core/Window.h"
@@ -529,7 +526,7 @@ void D3D12Renderer::BeginFrame(const Color& clearColor)
         LOG_ERROR("[D3D12] Command allocator reset failed");
         return;
     }
-    // Pipelines are bound lazily per draw path (quad / tile / ImGui), so the
+    // Pipelines are bound lazily per draw path (quad / tile), so the
     // list starts without one.
     if (FAILED(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr))) {
         LOG_ERROR("[D3D12] Command list reset failed");
@@ -762,13 +759,6 @@ bool D3D12Renderer::CreateSrvHeap()
     m_srvDescriptorSize =
         m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // Slots above the tile textures belong to ImGui. Filled back to front so
-    // allocation (pop_back) hands out ascending slot numbers.
-    m_srvFreeSlots.clear();
-    m_srvFreeSlots.reserve(kSrvHeapSize - kTileSrvCount);
-    for (UINT slot = kSrvHeapSize; slot-- > kTileSrvCount;) {
-        m_srvFreeSlots.push_back(slot);
-    }
     return true;
 }
 
@@ -1337,127 +1327,8 @@ void D3D12Renderer::ReleaseTileUploadBuffers()
     }
 }
 
-// --- Dear ImGui -------------------------------------------------------------
-
-void D3D12Renderer::ImGuiSrvAlloc(ImGui_ImplDX12_InitInfo* info,
-                                  D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
-                                  D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
-{
-    auto* self = static_cast<D3D12Renderer*>(info->UserData);
-    if (!self || !self->m_srvHeap || self->m_srvFreeSlots.empty()) {
-        LOG_ERROR("[D3D12] ImGui SRV descriptor request could not be served");
-        outCpu->ptr = 0;
-        outGpu->ptr = 0;
-        return;
-    }
-    const UINT slot = self->m_srvFreeSlots.back();
-    self->m_srvFreeSlots.pop_back();
-    *outCpu = self->SrvCpuHandle(slot);
-    *outGpu = self->SrvGpuHandle(slot);
-}
-
-void D3D12Renderer::ImGuiSrvFree(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
-                                 D3D12_GPU_DESCRIPTOR_HANDLE gpu)
-{
-    (void)gpu;
-    auto* self = static_cast<D3D12Renderer*>(info->UserData);
-    if (!self || !self->m_srvHeap || self->m_srvDescriptorSize == 0 || cpu.ptr == 0) {
-        return;
-    }
-    const SIZE_T base = self->m_srvHeap->GetCPUDescriptorHandleForHeapStart().ptr;
-    const UINT   slot = static_cast<UINT>((cpu.ptr - base) / self->m_srvDescriptorSize);
-    if (slot >= kTileSrvCount && slot < kSrvHeapSize) {
-        self->m_srvFreeSlots.push_back(slot);
-    }
-}
-
-bool D3D12Renderer::InitImGui(Window& window)
-{
-    if (m_imguiInitialized) {
-        return true;
-    }
-    if (!m_device || !m_commandQueue) {
-        LOG_ERROR("[D3D12] InitImGui called before Init");
-        return false;
-    }
-    // ImGui shares the tile SRV heap; create it here if the tile pass has not.
-    if (!CreateSrvHeap()) {
-        return false;
-    }
-
-    if (!ImGui_ImplSDL3_InitForD3D(window.GetSDLWindow())) {
-        LOG_ERROR("[D3D12] ImGui_ImplSDL3_InitForD3D failed");
-        return false;
-    }
-
-    ImGui_ImplDX12_InitInfo info;  // zero-initializes itself
-    info.Device               = m_device.Get();
-    info.CommandQueue         = m_commandQueue.Get();
-    info.NumFramesInFlight    = static_cast<int>(kFrameCount);
-    info.RTVFormat            = DXGI_FORMAT_R8G8B8A8_UNORM;
-    info.DSVFormat            = DXGI_FORMAT_UNKNOWN;
-    info.UserData             = this;
-    info.SrvDescriptorHeap    = m_srvHeap.Get();
-    info.SrvDescriptorAllocFn = &D3D12Renderer::ImGuiSrvAlloc;
-    info.SrvDescriptorFreeFn  = &D3D12Renderer::ImGuiSrvFree;
-
-    if (!ImGui_ImplDX12_Init(&info)) {
-        LOG_ERROR("[D3D12] ImGui_ImplDX12_Init failed");
-        ImGui_ImplSDL3_Shutdown();
-        return false;
-    }
-
-    m_imguiInitialized = true;
-    LOG_INFO("[D3D12] Dear ImGui initialized");
-    return true;
-}
-
-void D3D12Renderer::BeginImGuiFrame()
-{
-    if (!m_imguiInitialized) {
-        return;
-    }
-    ImGui_ImplDX12_NewFrame();
-}
-
-void D3D12Renderer::RenderImGui()
-{
-    if (!m_imguiInitialized || !m_frameActive || !m_srvHeap) {
-        return;
-    }
-    ImDrawData* drawData = ImGui::GetDrawData();
-    if (!drawData) {
-        return;
-    }
-
-    ID3D12DescriptorHeap* heaps[] = {m_srvHeap.Get()};
-    m_commandList->SetDescriptorHeaps(1, heaps);
-    ImGui_ImplDX12_RenderDrawData(drawData, m_commandList.Get());
-
-    // ImGui bound its own root signature, pipeline, and topology.
-    m_boundPipeline = BoundPipeline::None;
-}
-
-void D3D12Renderer::ShutdownImGui()
-{
-    if (!m_imguiInitialized) {
-        return;
-    }
-    m_imguiInitialized = false;
-
-    WaitForGpu();
-    ImGui_ImplDX12_Shutdown();
-    ImGui_ImplSDL3_Shutdown();
-}
-
 void D3D12Renderer::Shutdown()
 {
-    // Safety net if the application forgot; ShutdownImGui is idempotent and
-    // must run while the device still exists.
-    if (m_imguiInitialized) {
-        ShutdownImGui();
-    }
-
     WaitForGpu();
     m_frameActive = false;
 
@@ -1471,7 +1342,6 @@ void D3D12Renderer::Shutdown()
     m_tilePipelineState.Reset();
     m_tileRootSignature.Reset();
     m_srvHeap.Reset();
-    m_srvFreeSlots.clear();
     m_tileCpu.clear();
     m_tileResourcesReady = false;
     m_tileUpdatePending  = false;

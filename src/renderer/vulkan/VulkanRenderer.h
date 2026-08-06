@@ -26,10 +26,6 @@ public:
                           int mapWidth) override;
     void DrawTileMap(const TileDrawConstants& constants) override;
 
-    bool InitImGui(Window& window) override;
-    void BeginImGuiFrame() override;
-    void RenderImGui() override;
-    void ShutdownImGui() override;
 
     const char* GetBackendName() const override { return "Vulkan"; }
 
@@ -150,9 +146,6 @@ private:
     int  m_dirtyRowBegin     = 0;
     int  m_dirtyRowEnd       = 0;
 
-    // --- Dear ImGui -------------------------------------------------------
-    VkDescriptorPool m_imguiDescriptorPool = VK_NULL_HANDLE;
-    bool             m_imguiInitialized    = false;
 
     uint32_t m_frameIndex    = 0;
     uint32_t m_imageIndex    = 0;

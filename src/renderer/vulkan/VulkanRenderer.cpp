@@ -13,9 +13,6 @@
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_vulkan.h>
 
-#include <imgui.h>
-#include <imgui_impl_sdl3.h>
-#include <imgui_impl_vulkan.h>
 
 #include "core/Log.h"
 #include "core/Window.h"
@@ -1580,117 +1577,6 @@ void VulkanRenderer::DestroyTileImages()
     m_tileUploadPending  = false;
 }
 
-// --- Dear ImGui -------------------------------------------------------------
-
-bool VulkanRenderer::InitImGui(Window& window)
-{
-    if (m_imguiInitialized) {
-        return true;
-    }
-    if (m_device == VK_NULL_HANDLE || m_renderPass == VK_NULL_HANDLE) {
-        LOG_ERROR("[Vulkan] InitImGui called before the renderer is initialized");
-        return false;
-    }
-
-    if (!ImGui_ImplSDL3_InitForVulkan(window.GetSDLWindow())) {
-        LOG_ERROR("[Vulkan] ImGui_ImplSDL3_InitForVulkan failed");
-        return false;
-    }
-
-    // The vendored backend allocates SAMPLED_IMAGE sets per texture plus a few
-    // SAMPLER sets, and frees them individually, hence FREE_DESCRIPTOR_SET.
-    // COMBINED_IMAGE_SAMPLER is included for the obsolete AddTexture overload.
-    const VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64 },
-        { VK_DESCRIPTOR_TYPE_SAMPLER, 8 },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 },
-    };
-    VkDescriptorPoolCreateInfo poolInfo{};
-    poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    poolInfo.maxSets       = 88;
-    poolInfo.poolSizeCount = 3;
-    poolInfo.pPoolSizes    = poolSizes;
-
-    if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_imguiDescriptorPool) !=
-        VK_SUCCESS) {
-        LOG_ERROR("[Vulkan] vkCreateDescriptorPool failed for ImGui");
-        m_imguiDescriptorPool = VK_NULL_HANDLE;
-        ImGui_ImplSDL3_Shutdown();
-        return false;
-    }
-
-    ImGui_ImplVulkan_InitInfo initInfo{};
-    initInfo.ApiVersion     = VK_API_VERSION_1_2;  // matches VkApplicationInfo::apiVersion
-    initInfo.Instance       = m_instance;
-    initInfo.PhysicalDevice = m_physicalDevice;
-    initInfo.Device         = m_device;
-    initInfo.QueueFamily    = m_graphicsQueueFamily;
-    initInfo.Queue          = m_graphicsQueue;
-    initInfo.DescriptorPool = m_imguiDescriptorPool;
-    initInfo.MinImageCount  = 2;
-    initInfo.ImageCount     =
-        std::max(static_cast<uint32_t>(m_swapchainImages.size()), 2u);
-    initInfo.PipelineInfoMain.RenderPass  = m_renderPass;
-    initInfo.PipelineInfoMain.Subpass     = 0;
-    initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-
-    if (!ImGui_ImplVulkan_Init(&initInfo)) {
-        LOG_ERROR("[Vulkan] ImGui_ImplVulkan_Init failed");
-        ImGui_ImplSDL3_Shutdown();
-        vkDestroyDescriptorPool(m_device, m_imguiDescriptorPool, nullptr);
-        m_imguiDescriptorPool = VK_NULL_HANDLE;
-        return false;
-    }
-
-    m_imguiInitialized = true;
-    LOG_INFO("[Vulkan] ImGui initialized");
-    return true;
-}
-
-void VulkanRenderer::BeginImGuiFrame()
-{
-    if (!m_imguiInitialized) {
-        return;
-    }
-    ImGui_ImplVulkan_NewFrame();
-}
-
-void VulkanRenderer::RenderImGui()
-{
-    // Skipped frames record no command buffer, so there is nothing to draw into.
-    if (!m_imguiInitialized || !m_frameActive) {
-        return;
-    }
-    ImDrawData* drawData = ImGui::GetDrawData();
-    if (drawData == nullptr) {
-        return;
-    }
-    ImGui_ImplVulkan_RenderDrawData(drawData, m_commandBuffers[m_frameIndex]);
-}
-
-void VulkanRenderer::ShutdownImGui()
-{
-    if (!m_imguiInitialized) {
-        return;
-    }
-    m_imguiInitialized = false;
-
-    if (m_device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(m_device);
-    }
-    // The application owns the ImGui context; skip the backend shutdowns if it
-    // already destroyed it (they would assert on the missing context).
-    if (ImGui::GetCurrentContext() != nullptr) {
-        ImGui_ImplVulkan_Shutdown();
-        ImGui_ImplSDL3_Shutdown();
-    }
-    if (m_device != VK_NULL_HANDLE && m_imguiDescriptorPool != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(m_device, m_imguiDescriptorPool, nullptr);
-        m_imguiDescriptorPool = VK_NULL_HANDLE;
-    }
-}
-
 void VulkanRenderer::OnResize(int pixelWidth, int pixelHeight)
 {
     // Only flagged here: tearing the swapchain down inside the event handler
@@ -1714,10 +1600,7 @@ bool VulkanRenderer::RecreateSwapchain()
     DestroySwapchainObjects();
 
     // The render pass outlives this: the surface format does not change, only
-    // the extent and the image count do. ImGui needs no notification either:
-    // its pipeline hangs off that same render pass, and the MinImageCount it
-    // was initialized with (2) never changes, so there is no
-    // ImGui_ImplVulkan_SetMinImageCount to make.
+    // the extent and the image count do.
     if (!CreateSwapchain() || !CreateImageViews() || !CreateFramebuffers() ||
         !CreateImageSemaphores()) {
         DestroySwapchainObjects();  // leave a clean null state, not a half-built one
@@ -1764,10 +1647,6 @@ void VulkanRenderer::DestroySwapchainObjects()
 
 void VulkanRenderer::Shutdown()
 {
-    // Defensive: the application normally calls this itself before tearing
-    // down its ImGui context. A no-op when it did.
-    ShutdownImGui();
-
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
 

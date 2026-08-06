@@ -63,17 +63,6 @@ elseif(UNIX)
   target_link_libraries(lua PRIVATE dl m)
 endif()
 
-# ---- Dear ImGui (vendored, static library; one platform impl added below) ----
-add_library(imgui STATIC
-  third_party/imgui/imgui.cpp
-  third_party/imgui/imgui_draw.cpp
-  third_party/imgui/imgui_tables.cpp
-  third_party/imgui/imgui_widgets.cpp
-  third_party/imgui/backends/imgui_impl_sdl3.cpp)
-target_include_directories(imgui PUBLIC third_party/imgui third_party/imgui/backends)
-target_link_libraries(imgui PUBLIC SDL3::SDL3)
-set_target_properties(imgui PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-
 add_executable(engine
   src/main.cpp
   src/core/Config.cpp
@@ -86,25 +75,21 @@ add_executable(engine
   src/world/MapIO.cpp
   src/world/TileAtlas.cpp
   src/editor/EditorCamera.cpp
-  src/editor/MapEditor.cpp
   src/renderer/RendererFactory.cpp)
 
 target_include_directories(engine PRIVATE src third_party)
-target_link_libraries(engine PRIVATE SDL3::SDL3 lua imgui)
+target_link_libraries(engine PRIVATE SDL3::SDL3 lua)
 
 # Exactly one renderer backend is compiled per platform.
 # APPLE must be checked before UNIX: macOS matches both.
 if(WIN32)
   target_sources(engine PRIVATE src/renderer/dx12/D3D12Renderer.cpp)
-  target_sources(imgui PRIVATE third_party/imgui/backends/imgui_impl_dx12.cpp)
   target_compile_definitions(engine PRIVATE ENGINE_BACKEND_D3D12=1 NOMINMAX WIN32_LEAN_AND_MEAN)
   # d3dcompiler provides D3DCompile, used to build the quad shaders at runtime.
   target_link_libraries(engine PRIVATE d3d12 dxgi dxguid d3dcompiler)
 elseif(APPLE)
   target_sources(engine PRIVATE src/renderer/metal/MetalRenderer.mm)
-  target_sources(imgui PRIVATE third_party/imgui/backends/imgui_impl_metal.mm)
   set_source_files_properties(src/renderer/metal/MetalRenderer.mm
-    third_party/imgui/backends/imgui_impl_metal.mm
     PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   set_target_properties(engine PROPERTIES
     OBJCXX_STANDARD 20
@@ -117,10 +102,8 @@ elseif(APPLE)
 elseif(UNIX)
   find_package(Vulkan REQUIRED)
   target_sources(engine PRIVATE src/renderer/vulkan/VulkanRenderer.cpp)
-  target_sources(imgui PRIVATE third_party/imgui/backends/imgui_impl_vulkan.cpp)
   target_compile_definitions(engine PRIVATE ENGINE_BACKEND_VULKAN=1)
   target_link_libraries(engine PRIVATE Vulkan::Vulkan)
-  target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
 
   # Vulkan needs SPIR-V, so the GLSL sources are compiled at build time and
   # loaded from disk at runtime. Metal and D3D12 compile their shaders in-process

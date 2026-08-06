@@ -12,20 +12,12 @@
 --   editor — camera: pan_speed, zoom_min, zoom_max,
 --            keys = { up = "W", down = "S", left = "A", right = "D" }
 --
--- Map generation, rendering, and editing all run in C++; this file only
--- configures them. Press F5 in the engine to re-run it (regenerates the map).
+-- Map generation and rendering run in C++; this file only configures them.
+-- Press F5 in the engine to re-run it (regenerates the map).
 
 engine.log("Configuring the world")
 
--- Extra tile types for painting in the editor.
-tiles = {
-    { name = "slate",  color = {0.35, 0.38, 0.42, 1.0} },
-    { name = "rust",   color = {0.63, 0.32, 0.18, 1.0} },
-    { name = "moss",   color = {0.30, 0.45, 0.25, 1.0} },
-    { name = "water",  color = {0.16, 0.32, 0.50, 1.0}, walkable = false },
-}
-
--- The initial map: a two-color dark-grey checkerboard.
+-- The map: a two-color dark-grey checkerboard.
 map = {
     pattern = "checkerboard",
 

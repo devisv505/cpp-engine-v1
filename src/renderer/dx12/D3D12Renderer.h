@@ -13,8 +13,6 @@
 
 #include "renderer/IRenderer.h"
 
-struct ImGui_ImplDX12_InitInfo;
-
 namespace engine {
 
 class D3D12Renderer final : public IRenderer {
@@ -34,10 +32,6 @@ public:
                           int mapWidth) override;
     void DrawTileMap(const TileDrawConstants& constants) override;
 
-    bool InitImGui(Window& window) override;
-    void BeginImGuiFrame() override;
-    void RenderImGui() override;
-    void ShutdownImGui() override;
 
     const char* GetBackendName() const override { return "Direct3D 12"; }
 
@@ -52,14 +46,13 @@ private:
     static constexpr UINT kTileConstantCount =
         static_cast<UINT>(sizeof(TileDrawConstants) / sizeof(uint32_t));
 
-    // Shader-visible SRV heap layout: slots 0-2 hold the tile textures (ids,
-    // atlas, palette); the remaining slots are a free list handed to Dear
-    // ImGui through its descriptor alloc/free callbacks.
+    // Shader-visible SRV heap: slots 0-2 hold the tile textures (ids, atlas,
+    // palette). Sized with headroom for future descriptors.
     static constexpr UINT kSrvHeapSize  = 64;
     static constexpr UINT kTileSrvCount = 3;
 
     // What the command list currently has bound. Draw calls bind lazily so
-    // the tile, quad, and ImGui passes can interleave in any order.
+    // the tile and quad passes can interleave in any order.
     enum class BoundPipeline { None, Quad, Tile };
 
     bool CreateFactory();
@@ -92,13 +85,6 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle(UINT slot) const;
     D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle(UINT slot) const;
 
-    // Dear ImGui asks for SRV descriptors through these; they hand out slots
-    // kTileSrvCount..kSrvHeapSize-1 of m_srvHeap (info->UserData == this).
-    static void ImGuiSrvAlloc(ImGui_ImplDX12_InitInfo* info,
-                              D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
-                              D3D12_GPU_DESCRIPTOR_HANDLE* outGpu);
-    static void ImGuiSrvFree(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
-                             D3D12_GPU_DESCRIPTOR_HANDLE gpu);
 
     // Blocks until the fence reaches `value`; WaitForGpu drains everything
     // submitted so far, which is what resize and shutdown need.
@@ -132,7 +118,6 @@ private:
     uint8_t*                               m_tileUploadMapped[kFrameCount] = {};
 
     std::vector<uint16_t> m_tileCpu;      // CPU copy of the full tile-id grid
-    std::vector<UINT>     m_srvFreeSlots; // free ImGui descriptor slots
 
     HANDLE m_fenceEvent = nullptr;
     UINT64 m_fenceValue = 0;                 // last value signalled on the queue
@@ -169,7 +154,6 @@ private:
     bool m_resizePending      = false;
     bool m_frameActive        = false;  // BeginFrame succeeded and EndFrame has not run
     bool m_tileResourcesReady = false;
-    bool m_imguiInitialized   = false;
 };
 
 } // namespace engine
