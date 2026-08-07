@@ -73,15 +73,13 @@ bool Application::Init()
 
     // Subscribers first, pump later: everything must be listening before the
     // first Pump() in MainLoop publishes anything.
-    m_input.Init(m_events);
+    m_input.Init(m_events, m_baseDir + "config/input.json");
     m_onQuit = m_events.Subscribe<QuitRequested>([this](const QuitRequested&) {
         m_running = false;
     });
     m_onWorldRebuilt = m_events.Subscribe<WorldRebuilt>([](const WorldRebuilt& e) {
         LOG_INFO("World rebuilt: %dx%d tiles", e.mapSize.x, e.mapSize.y);
     });
-
-    m_inputMap.Load(m_baseDir + "config/input.json");
 
     m_renderer = CreateRenderer();
     LOG_INFO("Renderer backend: %s", m_renderer->GetBackendName());
@@ -162,11 +160,11 @@ bool Application::RebuildWorld()
 void Application::Update(const float deltaTime)
 {
     // One-shot actions: the press edge, so holding the key does not repeat.
-    if (m_inputMap.WasPressed(m_input, Action::Quit)) {
+    if (m_input.WasActionPressed(Action::Quit)) {
         m_events.Emit(QuitRequested{});
         return;
     }
-    if (m_inputMap.WasPressed(m_input, Action::ReloadScript)) {
+    if (m_input.WasActionPressed(Action::ReloadScript)) {
         LOG_INFO("Reloading script and regenerating the world");
         RebuildWorld();
         return;
@@ -184,7 +182,7 @@ void Application::MainLoop()
         const InputFrame inputFrame(m_input);
 
         // Publishes this frame's window and input events; subscribers react
-        // synchronously (Input records state, the renderer resizes, m_running
+        // synchronously (InputState records it, the renderer resizes, m_running
         // drops on QuitRequested).
         m_eventPump.Pump();
 

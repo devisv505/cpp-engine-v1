@@ -6,7 +6,6 @@
 #include "core/events/EventBus.h"
 #include "core/events/Events.h"
 #include "core/input/Input.h"
-#include "core/input/InputMap.h"
 #include "core/platform/SDLEventPump.h"
 #include "core/Scene2D.h"
 #include "core/Window.h"
@@ -55,11 +54,10 @@ private:
     WorldConfig  m_world;
     EditorCamera m_camera;
     Input        m_input;
-    InputMap     m_inputMap;
     EventBus     m_events;
 
     SDLEventPump           m_eventPump{m_events};
-    EditorCameraController m_cameraController{m_camera, m_input, m_inputMap, m_window};
+    EditorCameraController m_cameraController{m_camera, m_input, m_window};
 
     // Held for the lifetime of the app; dropping them unsubscribes.
     Subscription m_onQuit;

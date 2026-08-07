@@ -6,18 +6,19 @@
 #include "core/events/Events.h"
 #include "core/input/Input.h"
 #include "core/input/InputMap.h"
+#include "core/input/InputState.h"
 
 using namespace engine;
 using tests::TestRun;
 
 namespace {
 
-    // Input is fed through the bus, exactly as SDLEventPump feeds it at
-    // runtime. Each fixture is its own bus + subscribed Input, so multiple
+    // InputState is fed through the bus, exactly as SDLEventPump feeds it at
+    // runtime. Each fixture is its own bus + subscribed InputState, so multiple
     // fixtures in one test never hear each other's events.
     struct BusInput {
         EventBus bus;
-        Input    input;
+        InputState input;
 
         BusInput() { input.Init(bus); }
 
@@ -41,7 +42,7 @@ int main()
 
     {
         BusInput fixture;
-        Input&   input = fixture.input;
+        InputState& input = fixture.input;
         CHECK(t, "nothing is down initially", !input.IsScancodeDown(Scancode::W));
 
         fixture.Press(Scancode::W);
@@ -69,7 +70,7 @@ int main()
 
     {   // Edges: the reason one-shot actions can be polled instead of evented.
         BusInput fixture;
-        Input&   input = fixture.input;
+        InputState& input = fixture.input;
         fixture.Press(Scancode::F5);
         CHECK(t, "press edge fires once", input.WasScancodePressed(Scancode::F5));
         { const InputFrame frame(input); }
@@ -91,7 +92,7 @@ int main()
 
     {   // The RAII guard must hold even when the loop body exits early.
         BusInput fixture;
-        Input&   input = fixture.input;
+        InputState& input = fixture.input;
         InputMap map;
         int      fires = 0;
         fixture.Press(Scancode::F5);  // held throughout
@@ -152,6 +153,25 @@ int main()
         InputMap missing;
         CHECK(t, "a missing file reports failure", !missing.Load("input_tests_absent.json"));
         CHECK(t, "...and leaves the controls working", missing.IsDown(w.input, Action::CameraUp));
+    }
+
+    {   // The Input facade: state + bindings behind one front door.
+        EventBus bus;
+        Input    input;
+        input.Init(bus, "input_tests_absent.json");  // missing file -> defaults
+        bus.Emit(KeyPressed{Scancode::W});
+        CHECK(t, "facade answers action queries from bus-fed state",
+              input.IsActionDown(Action::CameraUp));
+        CHECK(t, "press edge shows through the facade",
+              input.WasActionPressed(Action::CameraUp));
+        { const InputFrame frame(input); }
+        CHECK(t, "InputFrame advances the facade's state",
+              input.IsActionDown(Action::CameraUp)
+              && !input.WasActionPressed(Action::CameraUp));
+        CHECK(t, "raw device state is reachable behind State()",
+              input.State().IsScancodeDown(Scancode::W));
+        input.Clear();
+        CHECK(t, "Clear drops held state", !input.IsActionDown(Action::CameraUp));
     }
 
     return t.Result();

@@ -9,7 +9,7 @@
 
 namespace engine {
 
-    class Input;
+    class InputState;
 
     // Binds physical keys to actions, loaded from config/input.json.
     //
@@ -26,8 +26,8 @@ namespace engine {
 
             void SetDefaults();
 
-            [[nodiscard]] bool IsDown(const Input& input, Action action) const;
-            [[nodiscard]] bool WasPressed(const Input& input, Action action) const;
+            [[nodiscard]] bool IsDown(const InputState& input, Action action) const;
+            [[nodiscard]] bool WasPressed(const InputState& input, Action action) const;
 
         private:
             void Bind(Action action, std::initializer_list<Scancode> scancodes);

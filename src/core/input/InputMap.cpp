@@ -6,7 +6,7 @@
 #include <SDL3/SDL_keyboard.h>
 
 #include "core/Log.h"
-#include "core/input/Input.h"
+#include "core/input/InputState.h"
 
 namespace engine {
 
@@ -118,7 +118,7 @@ namespace engine {
         return true;
     }
 
-    bool InputMap::IsDown(const Input& input, const Action action) const
+    bool InputMap::IsDown(const InputState& input, const Action action) const
     {
         const auto& bindings = m_bindings[static_cast<std::size_t>(action)];
 
@@ -129,7 +129,7 @@ namespace engine {
             });
     }
 
-    bool InputMap::WasPressed(const Input& input, const Action action) const
+    bool InputMap::WasPressed(const InputState& input, const Action action) const
     {
         const auto& bindings = m_bindings[static_cast<std::size_t>(action)];
 

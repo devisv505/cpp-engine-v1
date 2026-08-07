@@ -78,7 +78,7 @@ add_executable(engine
         src/editor/EditorCameraController.cpp
         src/renderer/RendererFactory.cpp
         src/core/platform/SDLEventPump.cpp
-        src/core/input/Input.cpp
+        src/core/input/InputState.cpp
         src/core/input/InputMap.cpp)
 
 target_include_directories(engine PRIVATE src third_party)
@@ -173,7 +173,7 @@ if(ENGINE_BUILD_TESTS)
   # Sources the tests exercise. The engine target itself is an executable, so
   # the shared code is compiled again here rather than linked from it.
   set(ENGINE_TEST_SOURCES
-    src/core/input/Input.cpp
+    src/core/input/InputState.cpp
     src/core/input/InputMap.cpp
     src/editor/EditorCamera.cpp)
 

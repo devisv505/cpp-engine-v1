@@ -1,10 +1,10 @@
-#include "core/input/Input.h"
+#include "core/input/InputState.h"
 
 #include "core/events/Events.h"
 
 namespace engine {
 
-    void Input::Init(EventBus& events)
+    void InputState::Init(EventBus& events)
     {
         m_subscriptions.clear();
 
@@ -44,7 +44,7 @@ namespace engine {
             }));
     }
 
-    void Input::SetKey(const Scancode scancode, const bool down)
+    void InputState::SetKey(const Scancode scancode, const bool down)
     {
         const auto index = static_cast<std::size_t>(scancode);
         if (index > 0 && index < kScancodeCount) {
@@ -52,7 +52,7 @@ namespace engine {
         }
     }
 
-    void Input::SetMouseButton(const MouseButton button, const bool down)
+    void InputState::SetMouseButton(const MouseButton button, const bool down)
     {
         const auto index = static_cast<std::size_t>(button);
         if (index < m_mouseButtons.size()) {
@@ -60,7 +60,7 @@ namespace engine {
         }
     }
 
-    bool Input::IsScancodeDown(const Scancode scancode) const
+    bool InputState::IsScancodeDown(const Scancode scancode) const
     {
         const auto index = static_cast<std::size_t>(scancode);
         if (index == 0 || index >= kScancodeCount) {
@@ -69,7 +69,7 @@ namespace engine {
         return m_keys[index];
     }
 
-    bool Input::WasScancodePressed(const Scancode scancode) const
+    bool InputState::WasScancodePressed(const Scancode scancode) const
     {
         const auto index = static_cast<std::size_t>(scancode);
         if (index == 0 || index >= kScancodeCount) {
@@ -78,7 +78,7 @@ namespace engine {
         return m_keys[index] && !m_previousKeys[index];
     }
 
-    bool Input::IsMouseButtonDown(MouseButton button) const
+    bool InputState::IsMouseButtonDown(MouseButton button) const
     {
         const auto index = static_cast<std::size_t>(button);
         if (index >= m_mouseButtons.size()) {
@@ -87,7 +87,7 @@ namespace engine {
         return m_mouseButtons[index];
     }
 
-    bool Input::WasMouseButtonPressed(MouseButton button) const
+    bool InputState::WasMouseButtonPressed(MouseButton button) const
     {
         const auto index = static_cast<std::size_t>(button);
         if (index >= m_mouseButtons.size()) {
@@ -96,7 +96,7 @@ namespace engine {
         return m_mouseButtons[index] && !m_previousMouseButtons[index];
     }
 
-    bool Input::WasMouseButtonReleased(MouseButton button) const
+    bool InputState::WasMouseButtonReleased(MouseButton button) const
     {
         const auto index = static_cast<std::size_t>(button);
         if (index >= m_mouseButtons.size()) {
@@ -105,24 +105,24 @@ namespace engine {
         return !m_mouseButtons[index] && m_previousMouseButtons[index];
     }
 
-    float Input::GetWheelDelta() const
+    float InputState::GetWheelDelta() const
     {
         return m_wheelDelta;
     }
 
-    void Input::EndFrame()
+    void InputState::EndFrame()
     {
         m_previousKeys         = m_keys;
         m_previousMouseButtons = m_mouseButtons;
         m_wheelDelta           = 0.0f;
     }
 
-    Vector2 Input::GetMousePosition() const
+    Vector2 InputState::GetMousePosition() const
     {
         return m_mousePosition;
     }
 
-    void Input::Clear()
+    void InputState::Clear()
     {
         m_keys.fill(false);
         m_mouseButtons.fill(false);

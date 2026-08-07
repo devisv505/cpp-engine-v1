@@ -7,7 +7,7 @@ namespace engine {
     // The only component that polls and understands raw SDL events. Pump()
     // drains SDL's queue once per frame and republishes what the engine cares
     // about as the engine-defined events in Events.h; everything else
-    // (Window, Input, renderers, Application) subscribes to those and never
+    // (Window, InputState, renderers, Application) subscribes to those and never
     // sees an SDL_Event.
     class SDLEventPump {
         public:

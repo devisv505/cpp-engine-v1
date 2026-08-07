@@ -4,7 +4,6 @@ namespace engine {
 
     class EditorCamera;
     class Input;
-    class InputMap;
     class Window;
 
     // Drives EditorCamera from input state each frame: action-bound panning,
@@ -14,17 +13,15 @@ namespace engine {
     class EditorCameraController {
         public:
             EditorCameraController(EditorCamera& camera, const Input& input,
-                                   const InputMap& inputMap, const Window& window)
-                : m_camera(camera), m_input(input)
-                , m_inputMap(inputMap), m_window(window) {}
+                                   const Window& window)
+                : m_camera(camera), m_input(input), m_window(window) {}
 
             void Update(float deltaTime) const;
 
         private:
-            EditorCamera&   m_camera;
-            const Input&    m_input;
-            const InputMap& m_inputMap;
-            const Window&   m_window;
+            EditorCamera& m_camera;
+            const Input&  m_input;
+            const Window& m_window;
     };
 
 } // namespace engine
