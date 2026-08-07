@@ -202,7 +202,7 @@ bool Application::Update(const float deltaTime)
     m_camera.SetPanInput(direction.x, direction.y);
 
     if (const float wheel = m_input.GetWheelDelta(); wheel != 0.0f) {
-        m_camera.OnMouseWheel(wheel, mouse.x, mouse.y);
+        m_camera.OnMouseWheel(wheel);
     }
 
     // Edges, not held state: re-anchoring the drag every frame would pin the

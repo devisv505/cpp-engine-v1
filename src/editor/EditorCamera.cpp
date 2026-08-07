@@ -30,12 +30,9 @@ void EditorCamera::ScreenToWorld(float sx, float sy, float& wx, float& wy) const
     wy = m_y + (sy - m_viewportH * 0.5f) / m_zoom;
 }
 
-void EditorCamera::OnMouseWheel(float wheelY, float mouseX, float mouseY)
+void EditorCamera::OnMouseWheel(float wheelY)
 {
-    (void)mouseX;
-    (void)mouseY;
-    // Each wheel notch scales the target; the smoothing in Update re-anchors
-    // on the live cursor position every frame.
+    // Each notch scales the target; Update eases the live zoom towards it.
     m_targetZoom = std::clamp(m_targetZoom * std::pow(1.25f, wheelY), m_zoomMin, m_zoomMax);
 }
 
@@ -57,20 +54,13 @@ void EditorCamera::Update(float dt, float mouseX, float mouseY, int viewportW, i
         m_y += (m_panY / length) * m_panSpeed / m_zoom * dt;
     }
 
-    // Exponential zoom smoothing anchored on the cursor: the world point under
-    // the mouse before the zoom step is put back under it afterwards.
+    // Zoom is centred on the screen: the world point at the viewport centre is
+    // (m_x, m_y) whatever the zoom, so easing m_zoom alone keeps it fixed and
+    // no camera translation is needed.
     if (std::fabs(m_targetZoom - m_zoom) > 1e-4f * m_zoom) {
-        float anchorX = 0.0f, anchorY = 0.0f;
-        ScreenToWorld(mouseX, mouseY, anchorX, anchorY);
-
         const float rate = 1.0f - std::exp(-14.0f * dt);
         m_zoom += (m_targetZoom - m_zoom) * rate;
         m_zoom = std::clamp(m_zoom, m_zoomMin, m_zoomMax);
-
-        float afterX = 0.0f, afterY = 0.0f;
-        ScreenToWorld(mouseX, mouseY, afterX, afterY);
-        m_x += anchorX - afterX;
-        m_y += anchorY - afterY;
     } else {
         m_zoom = m_targetZoom;
     }

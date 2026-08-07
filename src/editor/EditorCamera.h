@@ -16,7 +16,7 @@ public:
     // dt in seconds; mouse position in framebuffer pixels.
     void Update(float dt, float mouseX, float mouseY, int viewportW, int viewportH);
 
-    void OnMouseWheel(float wheelY, float mouseX, float mouseY);
+    void OnMouseWheel(float wheelY);
     void BeginDrag(float mouseX, float mouseY);
     void EndDrag() { m_dragging = false; }
     bool IsDragging() const { return m_dragging; }
