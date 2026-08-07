@@ -64,19 +64,21 @@ elseif(UNIX)
 endif()
 
 add_executable(engine
-  src/main.cpp
-  src/core/Config.cpp
-  src/core/Window.cpp
-  src/core/Application.cpp
-  src/scripting/ScriptHost.cpp
-  src/world/TileRegistry.cpp
-  src/world/TileMap.cpp
-  src/world/MapPatterns.cpp
-  src/world/MapIO.cpp
-  src/world/TileAtlas.cpp
-  src/editor/EditorCamera.cpp
-  src/renderer/RendererFactory.cpp
-        src/core/input/Input.h)
+        src/main.cpp
+        src/core/Config.cpp
+        src/core/Window.cpp
+        src/core/Application.cpp
+        src/scripting/ScriptHost.cpp
+        src/world/TileRegistry.cpp
+        src/world/TileMap.cpp
+        src/world/MapPatterns.cpp
+        src/world/MapIO.cpp
+        src/world/TileAtlas.cpp
+        src/editor/EditorCamera.cpp
+        src/renderer/RendererFactory.cpp
+        src/core/input/Input.h
+        src/core/math/Vector2.h
+        src/core/math/Vector2Int.h)
 
 target_include_directories(engine PRIVATE src third_party)
 target_link_libraries(engine PRIVATE SDL3::SDL3 lua)
