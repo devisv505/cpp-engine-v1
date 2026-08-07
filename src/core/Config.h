@@ -5,7 +5,7 @@
 namespace engine {
 
 struct WindowConfig {
-    std::string title      = "Cpp Engine";
+    std::string title      = "Engine505";
     int         width      = 1280;
     int         height     = 720;
     bool        fullscreen = false;

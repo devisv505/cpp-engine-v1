@@ -138,9 +138,9 @@ bool VulkanRenderer::CreateInstance()
 
     VkApplicationInfo appInfo{};
     appInfo.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName   = "Cpp Engine";
+    appInfo.pApplicationName   = "Engine505";
     appInfo.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
-    appInfo.pEngineName        = "Cpp Engine";
+    appInfo.pEngineName        = "Engine505";
     appInfo.engineVersion      = VK_MAKE_VERSION(0, 1, 0);
     appInfo.apiVersion         = VK_API_VERSION_1_2;
 

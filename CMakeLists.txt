@@ -14,7 +14,7 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin" AND NOT CMAKE_OSX_ARCHITECTURES)
   endif()
 endif()
 
-project(CppEngine VERSION 0.1.0 LANGUAGES C CXX)
+project(Engine505 VERSION 0.1.0 LANGUAGES C CXX)
 
 # OBJCXX must be enabled before SDL is added as a subdirectory (FetchContent
 # path): SDL enables OBJC in its own scope, and enabling OBJCXX afterwards

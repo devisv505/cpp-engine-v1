@@ -63,7 +63,7 @@ int Application::Run()
 
 bool Application::Init()
 {
-    SDL_SetAppMetadata("Cpp Engine", "0.1.0", "com.devisv.cppengine");
+    SDL_SetAppMetadata("Engine505", "0.1.0", "com.devisv.engine505");
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());

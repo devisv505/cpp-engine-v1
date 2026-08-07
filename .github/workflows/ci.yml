@@ -79,7 +79,7 @@ jobs:
           else
             VERSION="0.1.0-dev.${GITHUB_RUN_NUMBER}"
           fi
-          STAGE="cpp-engine-${VERSION}-${{ matrix.artifact }}"
+          STAGE="engine505-${VERSION}-${{ matrix.artifact }}"
           mkdir "$STAGE"
           cp "${{ matrix.bindir }}/engine${{ matrix.exe }}" "$STAGE/"
           # Package the runtime data exactly as the build staged it next to the
@@ -123,5 +123,5 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Cpp Engine $GITHUB_REF_NAME" \
+            --title "Engine505 $GITHUB_REF_NAME" \
             --generate-notes
