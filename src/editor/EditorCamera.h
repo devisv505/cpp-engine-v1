@@ -2,7 +2,6 @@
 
 #include <SDL3/SDL_keycode.h>
 
-#include "core/Scene2D.h"
 #include "world/WorldConfig.h"
 
 namespace engine {

@@ -20,8 +20,8 @@ public:
     bool Init(const WindowConfig& config, SDL_WindowFlags backendFlags);
     void Shutdown();
 
-    SDL_Window* GetSDLWindow() const { return m_window; }
-    const WindowConfig& GetConfig() const { return m_config; }
+    [[nodiscard]] SDL_Window* GetSDLWindow() const { return m_window; }
+    [[nodiscard]] const WindowConfig& GetConfig() const { return m_config; }
 
     // Framebuffer size in pixels, which differs from the logical window size on
     // HiDPI displays. This is what the renderer's viewport must use.

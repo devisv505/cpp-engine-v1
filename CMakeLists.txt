@@ -78,7 +78,9 @@ add_executable(engine
         src/renderer/RendererFactory.cpp
         src/core/input/Input.h
         src/core/math/Vector2.h
-        src/core/math/Vector2Int.h)
+        src/core/math/Vector2Int.h
+        src/core/input/Input.cpp
+        src/core/events/EventBus.h)
 
 target_include_directories(engine PRIVATE src third_party)
 target_link_libraries(engine PRIVATE SDL3::SDL3 lua)

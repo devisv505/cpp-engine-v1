@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "core/Scene2D.h"
+#include "renderer/RenderConstants.h"
 
 namespace engine {
 
