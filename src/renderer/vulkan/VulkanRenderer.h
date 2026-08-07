@@ -5,6 +5,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "core/events/EventBus.h"
 #include "renderer/IRenderer.h"
 
 namespace engine {
@@ -13,7 +14,7 @@ class VulkanRenderer final : public IRenderer {
 public:
     ~VulkanRenderer() override;
 
-    bool Init(Window& window) override;
+    bool Init(Window& window, EventBus& events) override;
     void Shutdown() override;
     void BeginFrame(const Color& clearColor) override;
     void DrawQuad(const Quad& quad) override;
@@ -79,6 +80,8 @@ private:
     VkShaderModule LoadShaderModule(const char* relativePath) const;
 
     Window* m_window = nullptr;  // borrowed; outlives the renderer
+
+    Subscription m_onWindowResized;
 
     VkInstance       m_instance            = VK_NULL_HANDLE;
     VkSurfaceKHR     m_surface             = VK_NULL_HANDLE;

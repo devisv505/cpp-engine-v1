@@ -14,6 +14,7 @@
 #include <SDL3/SDL_vulkan.h>
 
 
+#include "core/events/Events.h"
 #include "core/Log.h"
 #include "core/Window.h"
 #include "world/TileAtlas.h"
@@ -100,7 +101,7 @@ VulkanRenderer::~VulkanRenderer()
     Shutdown();
 }
 
-bool VulkanRenderer::Init(Window& window)
+bool VulkanRenderer::Init(Window& window, EventBus& events)
 {
     m_window = &window;
 
@@ -116,6 +117,11 @@ bool VulkanRenderer::Init(Window& window)
     if (!CreatePipeline())         return false;
     if (!CreateCommandResources()) return false;
     if (!CreateFrameSyncObjects()) return false;
+
+    // Subscribed last: a renderer that failed Init never hears about resizes.
+    m_onWindowResized = events.Subscribe<WindowResized>([this](const WindowResized& e) {
+        OnResize(e.size.x, e.size.y);
+    });
     return true;
 }
 
@@ -1647,6 +1653,7 @@ void VulkanRenderer::DestroySwapchainObjects()
 
 void VulkanRenderer::Shutdown()
 {
+    m_onWindowResized.Reset();  // a shut-down renderer must not hear resizes
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
 

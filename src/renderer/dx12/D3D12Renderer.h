@@ -11,6 +11,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include "core/events/EventBus.h"
 #include "renderer/IRenderer.h"
 
 namespace engine {
@@ -19,7 +20,7 @@ class D3D12Renderer final : public IRenderer {
 public:
     ~D3D12Renderer() override;
 
-    bool Init(Window& window) override;
+    bool Init(Window& window, EventBus& events) override;
     void Shutdown() override;
     void BeginFrame(const Color& clearColor) override;
     void DrawQuad(const Quad& quad) override;
@@ -90,6 +91,8 @@ private:
     // submitted so far, which is what resize and shutdown need.
     void WaitForFenceValue(UINT64 value);
     void WaitForGpu();
+
+    Subscription m_onWindowResized;
 
     Microsoft::WRL::ComPtr<IDXGIFactory6>             m_factory;
     Microsoft::WRL::ComPtr<IDXGIAdapter1>             m_adapter;

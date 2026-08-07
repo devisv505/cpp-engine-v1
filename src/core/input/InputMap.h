@@ -4,9 +4,8 @@
 #include <string>
 #include <vector>
 
-#include <SDL3/SDL_scancode.h>
-
 #include "core/input/Action.h"
+#include "core/input/InputCodes.h"
 
 namespace engine {
 
@@ -31,10 +30,10 @@ namespace engine {
             [[nodiscard]] bool WasPressed(const Input& input, Action action) const;
 
         private:
-            void Bind(Action action, std::initializer_list<SDL_Scancode> scancodes);
+            void Bind(Action action, std::initializer_list<Scancode> scancodes);
 
             // Several keys may drive one action (W and Up both pan up).
-            std::array<std::vector<SDL_Scancode>, kActionCount> m_bindings;
+            std::array<std::vector<Scancode>, kActionCount> m_bindings;
     };
 
 } // namespace engine

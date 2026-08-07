@@ -1,68 +1,80 @@
 #include "core/input/Input.h"
 
+#include "core/events/Events.h"
+
 namespace engine {
 
-    void Input::ProcessEvent(const SDL_Event& event)
+    void Input::Init(EventBus& events)
     {
-        switch (event.type) {
-        case SDL_EVENT_KEY_DOWN:
-        case SDL_EVENT_KEY_UP: {
-            // Auto-repeat re-sends KEY_DOWN for a key already held; the state is
-            // the same either way, so repeats need no special handling.
-            const SDL_Scancode scancode = event.key.scancode;
-            if (scancode > SDL_SCANCODE_UNKNOWN && scancode < SDL_SCANCODE_COUNT) {
-                m_keys[static_cast<std::size_t>(scancode)] = event.key.down;
-            }
-            break;
-        }
+        m_subscriptions.clear();
 
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        case SDL_EVENT_MOUSE_BUTTON_UP: {
-            const int index = ToMouseButtonIndex(event.button.button);
-            if (index >= 0) {
-                m_mouseButtons[static_cast<std::size_t>(index)] = event.button.down;
-            }
-            // Button events carry a position too, so tracking it here keeps the
-            // cursor correct even for a click with no preceding motion event.
-            m_mousePosition = {event.button.x, event.button.y};
-            break;
-        }
+        m_subscriptions.push_back(events.Subscribe<KeyPressed>(
+            [this](const KeyPressed& e) { SetKey(e.scancode, true); }));
 
-        case SDL_EVENT_MOUSE_WHEEL:
-            // Ticks accumulate: several wheel events can land in one frame.
-            m_wheelDelta += event.wheel.y;
-            m_mousePosition = {event.wheel.mouse_x, event.wheel.mouse_y};
-            break;
+        m_subscriptions.push_back(events.Subscribe<KeyReleased>(
+            [this](const KeyReleased& e) { SetKey(e.scancode, false); }));
 
-        case SDL_EVENT_MOUSE_MOTION:
-            m_mousePosition = {event.motion.x, event.motion.y};
-            break;
+        m_subscriptions.push_back(events.Subscribe<MouseButtonPressed>(
+            [this](const MouseButtonPressed& e) {
+                SetMouseButton(e.button, true);
+                m_mousePosition = e.position;
+            }));
 
-        case SDL_EVENT_WINDOW_FOCUS_LOST:
-            // Key-up arrives at whoever has focus, so without this a key held
-            // while alt-tabbing away would stay down forever.
-            Clear();
-            break;
+        m_subscriptions.push_back(events.Subscribe<MouseButtonReleased>(
+            [this](const MouseButtonReleased& e) {
+                SetMouseButton(e.button, false);
+                m_mousePosition = e.position;
+            }));
 
-        default:
-            break;
-        }
+        m_subscriptions.push_back(events.Subscribe<MouseMoved>(
+            [this](const MouseMoved& e) { m_mousePosition = e.position; }));
+
+        m_subscriptions.push_back(events.Subscribe<MouseWheel>(
+            [this](const MouseWheel& e) {
+                // Ticks accumulate: several wheel events can land in one frame.
+                m_wheelDelta   += e.delta;
+                m_mousePosition = e.position;
+            }));
+
+        m_subscriptions.push_back(events.Subscribe<WindowFocusLost>(
+            [this](const WindowFocusLost&) {
+                // Key-up arrives at whoever has focus, so without this a key
+                // held while alt-tabbing away would stay down forever.
+                Clear();
+            }));
     }
 
-    bool Input::IsScancodeDown(const SDL_Scancode scancode) const
+    void Input::SetKey(const Scancode scancode, const bool down)
     {
-        if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
-            return false;
-        }
-        return m_keys[static_cast<std::size_t>(scancode)];
-    }
-
-    bool Input::WasScancodePressed(const SDL_Scancode scancode) const
-    {
-        if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
-            return false;
-        }
         const auto index = static_cast<std::size_t>(scancode);
+        if (index > 0 && index < kScancodeCount) {
+            m_keys[index] = down;
+        }
+    }
+
+    void Input::SetMouseButton(const MouseButton button, const bool down)
+    {
+        const auto index = static_cast<std::size_t>(button);
+        if (index < m_mouseButtons.size()) {
+            m_mouseButtons[index] = down;
+        }
+    }
+
+    bool Input::IsScancodeDown(const Scancode scancode) const
+    {
+        const auto index = static_cast<std::size_t>(scancode);
+        if (index == 0 || index >= kScancodeCount) {
+            return false;
+        }
+        return m_keys[index];
+    }
+
+    bool Input::WasScancodePressed(const Scancode scancode) const
+    {
+        const auto index = static_cast<std::size_t>(scancode);
+        if (index == 0 || index >= kScancodeCount) {
+            return false;
+        }
         return m_keys[index] && !m_previousKeys[index];
     }
 
@@ -119,18 +131,6 @@ namespace engine {
         m_previousKeys.fill(false);
         m_previousMouseButtons.fill(false);
         m_wheelDelta = 0.0f;
-    }
-
-    int Input::ToMouseButtonIndex(Uint8 sdlButton)
-    {
-        switch (sdlButton) {
-        case SDL_BUTTON_LEFT:   return static_cast<int>(MouseButton::Left);
-        case SDL_BUTTON_MIDDLE: return static_cast<int>(MouseButton::Middle);
-        case SDL_BUTTON_RIGHT:  return static_cast<int>(MouseButton::Right);
-        case SDL_BUTTON_X1:     return static_cast<int>(MouseButton::X1);
-        case SDL_BUTTON_X2:     return static_cast<int>(MouseButton::X2);
-        default:                return -1;
-        }
     }
 
 } // namespace engine

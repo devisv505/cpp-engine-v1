@@ -3,19 +3,20 @@
 #include <memory>
 #include <string>
 
-#include "core/Config.h"
+#include "core/events/EventBus.h"
+#include "core/events/Events.h"
 #include "core/input/Input.h"
 #include "core/input/InputMap.h"
+#include "core/platform/SDLEventPump.h"
 #include "core/Scene2D.h"
 #include "core/Window.h"
 #include "editor/EditorCamera.h"
+#include "editor/EditorCameraController.h"
 #include "renderer/IRenderer.h"
 #include "scripting/ScriptHost.h"
 #include "world/TileMap.h"
 #include "world/TileRegistry.h"
 #include "world/WorldConfig.h"
-
-union SDL_Event;
 
 namespace engine {
 
@@ -35,17 +36,14 @@ private:
     // Runs the script and rebuilds the world from its globals: tile registry,
     // atlas, generated map, GPU tile resources, camera.
     bool RebuildWorld();
-    void HandleEvent(const SDL_Event& event, bool& running);
 
-    // Per-frame input-driven logic: camera movement, zoom, drag, one-shot
-    // actions. Everything here polls Input rather than reacting to events.
-    // Returns false when an action asked the engine to quit.
-    [[nodiscard]] bool Update(float deltaTime);
+    // Application-level actions only (quit, script reload); subsystems drive
+    // themselves from events and input state.
+    void Update(float deltaTime);
     void UpdateFps(float frameSeconds);
     void DrawFpsOverlay();
     void RenderFrame();
 
-    WindowConfig               m_config;
     Window                     m_window;
     Scene2D                    m_scene;
     ScriptHost                 m_scripts;
@@ -58,7 +56,16 @@ private:
     EditorCamera m_camera;
     Input        m_input;
     InputMap     m_inputMap;
+    EventBus     m_events;
 
+    SDLEventPump           m_eventPump{m_events};
+    EditorCameraController m_cameraController{m_camera, m_input, m_inputMap, m_window};
+
+    // Held for the lifetime of the app; dropping them unsubscribes.
+    Subscription m_onQuit;
+    Subscription m_onWorldRebuilt;
+
+    bool     m_running     = false;
     uint64_t m_lastFrameNs = 0;
     float    m_fpsElapsed  = 0.0f;
     uint32_t m_fpsFrames   = 0;

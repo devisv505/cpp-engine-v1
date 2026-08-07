@@ -7,6 +7,7 @@
 
 namespace engine {
 
+class EventBus;
 class Window;
 struct TileRenderData;
 
@@ -20,9 +21,11 @@ class IRenderer {
 public:
     virtual ~IRenderer() = default;
 
-    // Creates device objects and the swapchain for an already-created window.
+    // Creates device objects and the swapchain for an already-created window,
+    // and subscribes to WindowResized on the bus (implementations resize
+    // themselves; nothing calls OnResize from outside).
     // Returns false on failure; the app aborts startup.
-    virtual bool Init(Window& window) = 0;
+    virtual bool Init(Window& window, EventBus& events) = 0;
 
     // Releases all backend objects. Safe to call more than once.
     virtual void Shutdown() = 0;

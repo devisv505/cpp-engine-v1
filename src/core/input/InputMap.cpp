@@ -3,6 +3,7 @@
 #include <fstream>
 
 #include <nlohmann/json.hpp>
+#include <SDL3/SDL_keyboard.h>
 
 #include "core/Log.h"
 #include "core/input/Input.h"
@@ -14,7 +15,7 @@ namespace engine {
         SetDefaults();
     }
 
-    void InputMap::Bind(const Action action, std::initializer_list<SDL_Scancode> scancodes)
+    void InputMap::Bind(const Action action, std::initializer_list<Scancode> scancodes)
     {
         m_bindings[static_cast<std::size_t>(action)].assign(scancodes);
     }
@@ -24,12 +25,12 @@ namespace engine {
     // controllable; keep the two in step when changing either.
     void InputMap::SetDefaults()
     {
-        Bind(Action::CameraUp,     {SDL_SCANCODE_W, SDL_SCANCODE_UP});
-        Bind(Action::CameraDown,   {SDL_SCANCODE_S, SDL_SCANCODE_DOWN});
-        Bind(Action::CameraLeft,   {SDL_SCANCODE_A, SDL_SCANCODE_LEFT});
-        Bind(Action::CameraRight,  {SDL_SCANCODE_D, SDL_SCANCODE_RIGHT});
-        Bind(Action::ReloadScript, {SDL_SCANCODE_F5});
-        Bind(Action::Quit,         {SDL_SCANCODE_ESCAPE});
+        Bind(Action::CameraUp,     {Scancode::W, Scancode::Up});
+        Bind(Action::CameraDown,   {Scancode::S, Scancode::Down});
+        Bind(Action::CameraLeft,   {Scancode::A, Scancode::Left});
+        Bind(Action::CameraRight,  {Scancode::D, Scancode::Right});
+        Bind(Action::ReloadScript, {Scancode::F5});
+        Bind(Action::Quit,         {Scancode::Escape});
     }
 
     bool InputMap::Load(const std::string& path)
@@ -79,15 +80,18 @@ namespace engine {
                 continue;
             }
 
-            std::vector<SDL_Scancode> scancodes;
+            std::vector<Scancode> scancodes;
             for (const std::string& keyName : keyNames) {
+                // Key names resolve through SDL, the only place that knows
+                // them all; the cast is exact because engine scancode values
+                // mirror SDL's (see InputCodes.h).
                 const SDL_Scancode scancode = SDL_GetScancodeFromName(keyName.c_str());
                 if (scancode == SDL_SCANCODE_UNKNOWN) {
                     LOG_WARN("Input bindings: unknown key '%s' for action '%s'",
                              keyName.c_str(), name);
                     continue;
                 }
-                scancodes.push_back(scancode);
+                scancodes.push_back(static_cast<Scancode>(scancode));
             }
 
             if (scancodes.empty()) {
@@ -116,7 +120,7 @@ namespace engine {
 
     bool InputMap::IsDown(const Input& input, const Action action) const
     {
-        for (const SDL_Scancode scancode : m_bindings[static_cast<std::size_t>(action)]) {
+        for (const Scancode scancode : m_bindings[static_cast<std::size_t>(action)]) {
             if (input.IsScancodeDown(scancode)) {
                 return true;
             }
@@ -126,7 +130,7 @@ namespace engine {
 
     bool InputMap::WasPressed(const Input& input, const Action action) const
     {
-        for (const SDL_Scancode scancode : m_bindings[static_cast<std::size_t>(action)]) {
+        for (const Scancode scancode : m_bindings[static_cast<std::size_t>(action)]) {
             if (input.WasScancodePressed(scancode)) {
                 return true;
             }

@@ -71,16 +71,25 @@ bool Application::Init()
     }
     m_baseDir = BaseDir();
 
-    m_config = LoadWindowConfig(m_baseDir + "config/window.json");
+    // Subscribers first, pump later: everything must be listening before the
+    // first Pump() in MainLoop publishes anything.
+    m_input.Init(m_events);
+    m_onQuit = m_events.Subscribe<QuitRequested>([this](const QuitRequested&) {
+        m_running = false;
+    });
+    m_onWorldRebuilt = m_events.Subscribe<WorldRebuilt>([](const WorldRebuilt& e) {
+        LOG_INFO("World rebuilt: %dx%d tiles", e.mapSize.x, e.mapSize.y);
+    });
+
     m_inputMap.Load(m_baseDir + "config/input.json");
 
     m_renderer = CreateRenderer();
     LOG_INFO("Renderer backend: %s", m_renderer->GetBackendName());
 
-    if (!m_window.Init(m_config, GetRequiredWindowFlags())) {
+    if (!m_window.Init(m_baseDir + "config/window.json", GetRequiredWindowFlags())) {
         return false;
     }
-    if (!m_renderer->Init(m_window)) {
+    if (!m_renderer->Init(m_window, m_events)) {
         LOG_ERROR("Renderer initialization failed");
         return false;
     }
@@ -144,99 +153,47 @@ bool Application::RebuildWorld()
     m_camera.Configure(m_world.editor,
                        static_cast<int>(m_map.Width() * kTileSizePx),
                        static_cast<int>(m_map.Height() * kTileSizePx));
+
+    m_events.Emit(WorldRebuilt{{m_map.Width(), m_map.Height()}});
     m_input.Clear();  // a rebuild should not inherit keys held during the old world
     return true;
 }
 
-void Application::HandleEvent(const SDL_Event& event, bool& running)
+void Application::Update(const float deltaTime)
 {
-    // Input records device state; Update() reads it. Only events that carry
-    // information no amount of polling could recover stay in the switch below.
-    m_input.ProcessEvent(event);
-
-    switch (event.type) {
-        case SDL_EVENT_QUIT:
-            running = false;
-            break;
-
-        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-            if (event.window.windowID == SDL_GetWindowID(m_window.GetSDLWindow())) {
-                running = false;
-            }
-            break;
-
-        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-            m_renderer->OnResize(event.window.data1, event.window.data2);
-            break;
-
-        default:
-            break;
-    }
-}
-
-bool Application::Update(const float deltaTime)
-{
-    int pixelW = 0, pixelH = 0, logicalW = 0, logicalH = 0;
-    m_window.GetPixelSize(pixelW, pixelH);
-    SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
-
-    // Input reports window points; the camera works in framebuffer pixels.
-    const float   scale = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
-    const Vector2 mouse = m_input.GetMousePosition() * scale;
-
     // One-shot actions: the press edge, so holding the key does not repeat.
     if (m_inputMap.WasPressed(m_input, Action::Quit)) {
-        return false;
+        m_events.Emit(QuitRequested{});
+        return;
     }
     if (m_inputMap.WasPressed(m_input, Action::ReloadScript)) {
         LOG_INFO("Reloading script and regenerating the world");
         RebuildWorld();
-        return true;
+        return;
     }
 
-    Vector2 direction{};
-    if (m_inputMap.IsDown(m_input, Action::CameraUp))    direction.y -= 1.0f;
-    if (m_inputMap.IsDown(m_input, Action::CameraDown))  direction.y += 1.0f;
-    if (m_inputMap.IsDown(m_input, Action::CameraLeft))  direction.x -= 1.0f;
-    if (m_inputMap.IsDown(m_input, Action::CameraRight)) direction.x += 1.0f;
-    m_camera.SetPanInput(direction.x, direction.y);
-
-    if (const float wheel = m_input.GetWheelDelta(); wheel != 0.0f) {
-        m_camera.OnMouseWheel(wheel);
-    }
-
-    // Edges, not held state: re-anchoring the drag every frame would pin the
-    // map to the cursor and it would never move.
-    if (m_input.WasMouseButtonPressed(MouseButton::Middle)) {
-        m_camera.BeginDrag(mouse.x, mouse.y);
-    }
-    if (m_input.WasMouseButtonReleased(MouseButton::Middle)) {
-        m_camera.EndDrag();
-    }
-
-    m_camera.Update(deltaTime, mouse.x, mouse.y, pixelW, pixelH);
-    return true;
+    m_cameraController.Update(deltaTime);
 }
 
 void Application::MainLoop()
 {
-    bool running = true;
-    while (running) {
+    m_running = true;
+    while (m_running) {
         // Advances the input state when it goes out of scope, whatever path
         // this iteration takes out of the loop body.
         const InputFrame inputFrame(m_input);
 
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            HandleEvent(event, running);
-        }
+        // Publishes this frame's window and input events; subscribers react
+        // synchronously (Input records state, the renderer resizes, m_running
+        // drops on QuitRequested).
+        m_eventPump.Pump();
 
         const uint64_t nowNs = SDL_GetTicksNS();
         const float dt = std::min(0.1f, static_cast<float>(nowNs - m_lastFrameNs) * 1e-9f);
         m_lastFrameNs  = nowNs;
         UpdateFps(dt);
 
-        running = Update(dt);
+        Update(dt);
 
         int dx = 0, dy = 0, dw = 0, dh = 0;
         if (m_map.TakeDirtyRegion(dx, dy, dw, dh)) {
@@ -268,15 +225,8 @@ void Application::UpdateFps(float frameSeconds)
 
 void Application::DrawFpsOverlay()
 {
-    int pixelW = 0, pixelH = 0;
-    int logicalW = 0, logicalH = 0;
-    m_window.GetPixelSize(pixelW, pixelH);
-    SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
-
-    const float densityX = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
-    const float densityY = logicalH > 0 ? static_cast<float>(pixelH) / logicalH : densityX;
-    const float density  = std::max(1.0f, std::min(densityX, densityY));
-    const float cell     = std::max(2.0f, std::round(3.0f * density));
+    const float density = std::max(1.0f, m_window.GetPixelDensity());
+    const float cell    = std::max(2.0f, std::round(3.0f * density));
     const float padding  = cell * 1.5f;
     const float originX  = cell * 2.0f;
     const float originY  = cell * 2.0f;

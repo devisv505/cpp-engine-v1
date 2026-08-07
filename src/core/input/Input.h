@@ -1,23 +1,16 @@
 #pragma once
 #include <array>
-#include <SDL3/SDL_events.h>
+#include <vector>
+
+#include "core/events/EventBus.h"
+#include "core/input/InputCodes.h"
 #include "core/math/Vector2.h"
 
 namespace engine {
 
-    enum class MouseButton
-    {
-        Left,
-        Middle,
-        Right,
-        X1,
-        X2,
-
-        Count
-    };
-
-    // Raw keyboard and mouse state, fed by the application's event loop. Knows
-    // nothing about what any key means -- see InputMap for actions.
+    // Raw keyboard and mouse state, fed by the input events SDLEventPump
+    // publishes on the EventBus. Knows nothing about what any key means --
+    // see InputMap for actions.
     //
     // "Down" queries report what is held right now; "Was" queries report the
     // transition that happened during this frame. Advancing to the next frame
@@ -25,12 +18,14 @@ namespace engine {
     class Input {
         friend class InputFrame;
         public:
-            void ProcessEvent(const SDL_Event& event);
+            // Subscribes to the engine input events. Call once, before the
+            // first pump; the subscriptions last as long as this Input.
+            void Init(EventBus& events);
 
             // Keys are identified by physical scancode. Nothing here knows
             // what a key means -- InputMap turns scancodes into actions.
-            [[nodiscard]] bool IsScancodeDown(SDL_Scancode scancode) const;
-            [[nodiscard]] bool WasScancodePressed(SDL_Scancode scancode) const;
+            [[nodiscard]] bool IsScancodeDown(Scancode scancode) const;
+            [[nodiscard]] bool WasScancodePressed(Scancode scancode) const;
 
             [[nodiscard]] bool IsMouseButtonDown(MouseButton button) const;
             [[nodiscard]] bool WasMouseButtonPressed(MouseButton button) const;
@@ -39,12 +34,12 @@ namespace engine {
             // Wheel ticks accumulated since the last EndFrame; positive is up.
             [[nodiscard]] float GetWheelDelta() const;
 
-            // Window coordinates, not framebuffer pixels: SDL reports events in
+            // Window coordinates, not framebuffer pixels: input events report
             // points, and this class has no window to ask about pixel density.
             // Scale by the window's density if you need pixels.
             [[nodiscard]] engine::Vector2 GetMousePosition() const;
 
-            // Drops all held keys and buttons. Called on focus loss so keys do
+            // Drops all held keys and buttons. Runs on focus loss so keys do
             // not stay stuck down while the app is in the background.
             void Clear();
 
@@ -53,10 +48,11 @@ namespace engine {
             // Private so it can only happen via InputFrame.
             void EndFrame();
 
-            static int ToMouseButtonIndex(Uint8 sdlButton);
+            void SetKey(Scancode scancode, bool down);
+            void SetMouseButton(MouseButton button, bool down);
 
-            std::array<bool, SDL_SCANCODE_COUNT> m_keys{};
-            std::array<bool, SDL_SCANCODE_COUNT> m_previousKeys{};
+            std::array<bool, kScancodeCount> m_keys{};
+            std::array<bool, kScancodeCount> m_previousKeys{};
 
             std::array<
                 bool,
@@ -69,6 +65,8 @@ namespace engine {
 
             Vector2 m_mousePosition{};
             float   m_wheelDelta = 0.0f;
+
+            std::vector<Subscription> m_subscriptions;
     };
 
     // Declare one at the top of each iteration of the main loop:

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/events/EventBus.h"
 #include "renderer/IRenderer.h"
 
 namespace engine {
@@ -12,7 +13,7 @@ class MetalRenderer final : public IRenderer {
 public:
     ~MetalRenderer() override;
 
-    bool Init(Window& window) override;
+    bool Init(Window& window, EventBus& events) override;
     void Shutdown() override;
     void BeginFrame(const Color& clearColor) override;
     void DrawQuad(const Quad& quad) override;
@@ -27,7 +28,8 @@ public:
     const char* GetBackendName() const override { return "Metal"; }
 
 private:
-    MetalState* m_state = nullptr;
+    MetalState*  m_state = nullptr;
+    Subscription m_onWindowResized;
 };
 
 } // namespace engine

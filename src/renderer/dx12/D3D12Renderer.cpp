@@ -11,6 +11,7 @@
 #include <SDL3/SDL_video.h>
 
 
+#include "core/events/Events.h"
 #include "core/Log.h"
 #include "core/Window.h"
 #include "world/TileAtlas.h"
@@ -175,7 +176,7 @@ D3D12Renderer::~D3D12Renderer()
     Shutdown();
 }
 
-bool D3D12Renderer::Init(Window& window)
+bool D3D12Renderer::Init(Window& window, EventBus& events)
 {
     if (!CreateFactory())         return false;
     if (!PickAdapter())           return false;
@@ -187,6 +188,11 @@ bool D3D12Renderer::Init(Window& window)
     if (!CreatePipelineState())   return false;
     if (!CreateCommandObjects())  return false;
     if (!CreateSyncObjects())     return false;
+
+    // Subscribed last: a renderer that failed Init never hears about resizes.
+    m_onWindowResized = events.Subscribe<WindowResized>([this](const WindowResized& e) {
+        OnResize(e.size.x, e.size.y);
+    });
     return true;
 }
 
@@ -1329,6 +1335,7 @@ void D3D12Renderer::ReleaseTileUploadBuffers()
 
 void D3D12Renderer::Shutdown()
 {
+    m_onWindowResized.Reset();  // a shut-down renderer must not hear resizes
     WaitForGpu();
     m_frameActive = false;
 
