@@ -6,6 +6,7 @@
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_metal.h>
 
+#include "core/events/Events.h"
 #include "core/Log.h"
 #include "core/Window.h"
 #include "world/TileAtlas.h"
@@ -140,7 +141,7 @@ MetalRenderer::~MetalRenderer()
     Shutdown();
 }
 
-bool MetalRenderer::Init(Window& window)
+bool MetalRenderer::Init(Window& window, EventBus& events)
 {
     m_state = new MetalState();
 
@@ -228,6 +229,11 @@ bool MetalRenderer::Init(Window& window)
                   [[error localizedDescription] UTF8String]);
         return false;
     }
+
+    // Subscribed last: a renderer that failed Init never hears about resizes.
+    m_onWindowResized = events.Subscribe<WindowResized>([this](const WindowResized& e) {
+        OnResize(e.size.x, e.size.y);
+    });
 
     LOG_INFO("[Metal] Swapchain and quad pipeline ready (%dx%d, vsync %s)",
              pixelWidth, pixelHeight, window.GetConfig().vsync ? "on" : "off");
@@ -401,6 +407,7 @@ void MetalRenderer::EndFrame()
 
 void MetalRenderer::Shutdown()
 {
+    m_onWindowResized.Reset();  // a shut-down renderer must not hear resizes
     if (!m_state) {
         return;
     }

@@ -64,6 +64,13 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel 4
 
+      # Runs before Package so a red test also blocks artifacts and releases.
+      # The tests are headless (no window, no SDL_Init), so no display needed.
+      # -C Release selects the config on the Windows multi-config generator;
+      # the single-config Linux/macOS builds ignore it.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -C Release
+
       - name: Package
         shell: bash
         run: |

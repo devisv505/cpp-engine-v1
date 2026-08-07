@@ -380,15 +380,6 @@ bool ScriptHost::ReadWorldConfig(WorldConfig& config, TileRegistry& registry)
         config.editor.zoomMin  = FieldNumber(m_L, editor, "zoom_min", config.editor.zoomMin);
         config.editor.zoomMax  = FieldNumber(m_L, editor, "zoom_max", config.editor.zoomMax);
 
-        lua_getfield(m_L, editor, "keys");
-        if (lua_istable(m_L, -1)) {
-            const int keys = lua_absindex(m_L, -1);
-            config.editor.keyUp    = FieldString(m_L, keys, "up", config.editor.keyUp);
-            config.editor.keyDown  = FieldString(m_L, keys, "down", config.editor.keyDown);
-            config.editor.keyLeft  = FieldString(m_L, keys, "left", config.editor.keyLeft);
-            config.editor.keyRight = FieldString(m_L, keys, "right", config.editor.keyRight);
-        }
-        lua_pop(m_L, 1);
     }
     lua_pop(m_L, 1);
 

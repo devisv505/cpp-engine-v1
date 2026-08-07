@@ -64,18 +64,22 @@ elseif(UNIX)
 endif()
 
 add_executable(engine
-  src/main.cpp
-  src/core/Config.cpp
-  src/core/Window.cpp
-  src/core/Application.cpp
-  src/scripting/ScriptHost.cpp
-  src/world/TileRegistry.cpp
-  src/world/TileMap.cpp
-  src/world/MapPatterns.cpp
-  src/world/MapIO.cpp
-  src/world/TileAtlas.cpp
-  src/editor/EditorCamera.cpp
-  src/renderer/RendererFactory.cpp)
+        src/main.cpp
+        src/core/Config.cpp
+        src/core/Window.cpp
+        src/core/Application.cpp
+        src/scripting/ScriptHost.cpp
+        src/world/TileRegistry.cpp
+        src/world/TileMap.cpp
+        src/world/MapPatterns.cpp
+        src/world/MapIO.cpp
+        src/world/TileAtlas.cpp
+        src/editor/EditorCamera.cpp
+        src/editor/EditorCameraController.cpp
+        src/renderer/RendererFactory.cpp
+        src/core/platform/SDLEventPump.cpp
+        src/core/input/InputState.cpp
+        src/core/input/InputMap.cpp)
 
 target_include_directories(engine PRIVATE src third_party)
 target_link_libraries(engine PRIVATE SDL3::SDL3 lua)
@@ -149,8 +153,36 @@ add_custom_target(engine_data
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_SOURCE_DIR}/config/window.json"
           "$<TARGET_FILE_DIR:engine>/config/window.json"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/config/input.json"
+          "$<TARGET_FILE_DIR:engine>/config/input.json"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CMAKE_SOURCE_DIR}/scripts"
           "$<TARGET_FILE_DIR:engine>/scripts"
   COMMENT "Staging runtime data next to executable")
 add_dependencies(engine engine_data)
+
+# ---- Tests -------------------------------------------------------------
+# Plain executables, one per area; ctest reads their exit codes. Off in
+# release packaging via -DENGINE_BUILD_TESTS=OFF.
+option(ENGINE_BUILD_TESTS "Build the unit tests" ON)
+
+if(ENGINE_BUILD_TESTS)
+  enable_testing()
+
+  # Sources the tests exercise. The engine target itself is an executable, so
+  # the shared code is compiled again here rather than linked from it.
+  set(ENGINE_TEST_SOURCES
+    src/core/input/InputState.cpp
+    src/core/input/InputMap.cpp
+    src/editor/EditorCamera.cpp)
+
+  foreach(ENGINE_TEST Math Input EventBus Camera)
+    add_executable(${ENGINE_TEST}Tests
+      tests/${ENGINE_TEST}Tests.cpp
+      ${ENGINE_TEST_SOURCES})
+    target_include_directories(${ENGINE_TEST}Tests PRIVATE src third_party tests)
+    target_link_libraries(${ENGINE_TEST}Tests PRIVATE SDL3::SDL3)
+    add_test(NAME ${ENGINE_TEST} COMMAND ${ENGINE_TEST}Tests)
+  endforeach()
+endif()

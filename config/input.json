@@ -1,0 +1,13 @@
+{
+  "_comment": "Binds physical key positions to engine actions. Names are SDL key names (see SDL_GetScancodeFromName): letters, 'Up', 'Left Shift', 'Keypad 8', 'F5', ... Each action takes one key name or a list. Omitted actions keep their built-in default.",
+
+  "actions": {
+    "camera_up":     ["W", "Up"],
+    "camera_down":   ["S", "Down"],
+    "camera_left":   ["A", "Left"],
+    "camera_right":  ["D", "Right"],
+
+    "reload_script": ["F5"],
+    "quit":          ["Escape"]
+  }
+}

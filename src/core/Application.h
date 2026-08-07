@@ -3,17 +3,19 @@
 #include <memory>
 #include <string>
 
-#include "core/Config.h"
+#include "core/events/EventBus.h"
+#include "core/events/Events.h"
+#include "core/input/Input.h"
+#include "core/platform/SDLEventPump.h"
 #include "core/Scene2D.h"
 #include "core/Window.h"
 #include "editor/EditorCamera.h"
+#include "editor/EditorCameraController.h"
 #include "renderer/IRenderer.h"
 #include "scripting/ScriptHost.h"
 #include "world/TileMap.h"
 #include "world/TileRegistry.h"
 #include "world/WorldConfig.h"
-
-union SDL_Event;
 
 namespace engine {
 
@@ -33,10 +35,14 @@ private:
     // Runs the script and rebuilds the world from its globals: tile registry,
     // atlas, generated map, GPU tile resources, camera.
     bool RebuildWorld();
-    void HandleEvent(const SDL_Event& event, bool& running);
+
+    // Application-level actions only (quit, script reload); subsystems drive
+    // themselves from events and input state.
+    void Update(float deltaTime);
+    void UpdateFps(float frameSeconds);
+    void DrawFpsOverlay();
     void RenderFrame();
 
-    WindowConfig               m_config;
     Window                     m_window;
     Scene2D                    m_scene;
     ScriptHost                 m_scripts;
@@ -47,11 +53,21 @@ private:
     TileMap      m_map;
     WorldConfig  m_world;
     EditorCamera m_camera;
+    Input        m_input;
+    EventBus     m_events;
 
+    SDLEventPump           m_eventPump{m_events};
+    EditorCameraController m_cameraController{m_camera, m_input, m_window};
+
+    // Held for the lifetime of the app; dropping them unsubscribes.
+    Subscription m_onQuit;
+    Subscription m_onWorldRebuilt;
+
+    bool     m_running     = false;
     uint64_t m_lastFrameNs = 0;
-
-    // Keyboard pan state (configurable keys, see EditorConfig).
-    bool m_panUp = false, m_panDown = false, m_panLeft = false, m_panRight = false;
+    float    m_fpsElapsed  = 0.0f;
+    uint32_t m_fpsFrames   = 0;
+    uint32_t m_displayFps  = 0;
 };
 
 } // namespace engine
