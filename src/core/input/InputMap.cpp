@@ -120,22 +120,26 @@ namespace engine {
 
     bool InputMap::IsDown(const Input& input, const Action action) const
     {
-        for (const Scancode scancode : m_bindings[static_cast<std::size_t>(action)]) {
-            if (input.IsScancodeDown(scancode)) {
-                return true;
-            }
-        }
-        return false;
+        const auto& bindings = m_bindings[static_cast<std::size_t>(action)];
+
+        return std::ranges::any_of(
+            bindings,
+            [&input](const Scancode scancode) {
+                return input.IsScancodeDown(scancode);
+            });
     }
 
     bool InputMap::WasPressed(const Input& input, const Action action) const
     {
-        for (const Scancode scancode : m_bindings[static_cast<std::size_t>(action)]) {
-            if (input.WasScancodePressed(scancode)) {
-                return true;
+        const auto& bindings = m_bindings[static_cast<std::size_t>(action)];
+
+        return std::ranges::any_of(
+            bindings,
+            [&input](const Scancode scancode)
+            {
+                return input.WasScancodePressed(scancode);
             }
-        }
-        return false;
+        );
     }
 
 } // namespace engine
