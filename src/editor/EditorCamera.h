@@ -1,6 +1,5 @@
 #pragma once
 
-#include <SDL3/SDL_keycode.h>
 
 #include "world/WorldConfig.h"
 
@@ -31,7 +30,6 @@ public:
     float  Y() const { return m_y; }
     void   CenterOn(float wx, float wy) { m_x = wx; m_y = wy; }
 
-    SDL_Keycode keyUp = SDLK_W, keyDown = SDLK_S, keyLeft = SDLK_A, keyRight = SDLK_D;
 
 private:
     float m_x = 0.0f, m_y = 0.0f;   // world pixels at viewport center

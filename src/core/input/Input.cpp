@@ -28,6 +28,12 @@ namespace engine {
             break;
         }
 
+        case SDL_EVENT_MOUSE_WHEEL:
+            // Ticks accumulate: several wheel events can land in one frame.
+            m_wheelDelta += event.wheel.y;
+            m_mousePosition = {event.wheel.mouse_x, event.wheel.mouse_y};
+            break;
+
         case SDL_EVENT_MOUSE_MOTION:
             m_mousePosition = {event.motion.x, event.motion.y};
             break;
@@ -43,22 +49,60 @@ namespace engine {
         }
     }
 
-    bool Input::IsKeyPressed(const Key key) const
+    bool Input::IsScancodeDown(const SDL_Scancode scancode) const
     {
-        const SDL_Scancode scancode = ToSDLScancode(key);
-        if (scancode == SDL_SCANCODE_UNKNOWN) {
+        if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
             return false;
         }
         return m_keys[static_cast<std::size_t>(scancode)];
     }
 
-    bool Input::IsMouseButtonPressed(MouseButton button) const
+    bool Input::WasScancodePressed(const SDL_Scancode scancode) const
+    {
+        if (scancode <= SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT) {
+            return false;
+        }
+        const auto index = static_cast<std::size_t>(scancode);
+        return m_keys[index] && !m_previousKeys[index];
+    }
+
+    bool Input::IsMouseButtonDown(MouseButton button) const
     {
         const auto index = static_cast<std::size_t>(button);
         if (index >= m_mouseButtons.size()) {
             return false;
         }
         return m_mouseButtons[index];
+    }
+
+    bool Input::WasMouseButtonPressed(MouseButton button) const
+    {
+        const auto index = static_cast<std::size_t>(button);
+        if (index >= m_mouseButtons.size()) {
+            return false;
+        }
+        return m_mouseButtons[index] && !m_previousMouseButtons[index];
+    }
+
+    bool Input::WasMouseButtonReleased(MouseButton button) const
+    {
+        const auto index = static_cast<std::size_t>(button);
+        if (index >= m_mouseButtons.size()) {
+            return false;
+        }
+        return !m_mouseButtons[index] && m_previousMouseButtons[index];
+    }
+
+    float Input::GetWheelDelta() const
+    {
+        return m_wheelDelta;
+    }
+
+    void Input::EndFrame()
+    {
+        m_previousKeys         = m_keys;
+        m_previousMouseButtons = m_mouseButtons;
+        m_wheelDelta           = 0.0f;
     }
 
     Vector2 Input::GetMousePosition() const
@@ -70,52 +114,11 @@ namespace engine {
     {
         m_keys.fill(false);
         m_mouseButtons.fill(false);
-    }
-
-    SDL_Scancode Input::ToSDLScancode(Key key)
-    {
-        switch (key) {
-        case Key::W: return SDL_SCANCODE_W;
-        case Key::A: return SDL_SCANCODE_A;
-        case Key::S: return SDL_SCANCODE_S;
-        case Key::D: return SDL_SCANCODE_D;
-
-        case Key::Up:    return SDL_SCANCODE_UP;
-        case Key::Down:  return SDL_SCANCODE_DOWN;
-        case Key::Left:  return SDL_SCANCODE_LEFT;
-        case Key::Right: return SDL_SCANCODE_RIGHT;
-
-        case Key::Space:     return SDL_SCANCODE_SPACE;
-        case Key::Enter:     return SDL_SCANCODE_RETURN;
-        case Key::Escape:    return SDL_SCANCODE_ESCAPE;
-        case Key::Tab:       return SDL_SCANCODE_TAB;
-        case Key::Backspace: return SDL_SCANCODE_BACKSPACE;
-
-        case Key::LeftShift:  return SDL_SCANCODE_LSHIFT;
-        case Key::RightShift: return SDL_SCANCODE_RSHIFT;
-        case Key::LeftCtrl:   return SDL_SCANCODE_LCTRL;
-        case Key::RightCtrl:  return SDL_SCANCODE_RCTRL;
-        case Key::LeftAlt:    return SDL_SCANCODE_LALT;
-        case Key::RightAlt:   return SDL_SCANCODE_RALT;
-
-        case Key::F1:  return SDL_SCANCODE_F1;
-        case Key::F2:  return SDL_SCANCODE_F2;
-        case Key::F3:  return SDL_SCANCODE_F3;
-        case Key::F4:  return SDL_SCANCODE_F4;
-        case Key::F5:  return SDL_SCANCODE_F5;
-        case Key::F6:  return SDL_SCANCODE_F6;
-        case Key::F7:  return SDL_SCANCODE_F7;
-        case Key::F8:  return SDL_SCANCODE_F8;
-        case Key::F9:  return SDL_SCANCODE_F9;
-        case Key::F10: return SDL_SCANCODE_F10;
-        case Key::F11: return SDL_SCANCODE_F11;
-        case Key::F12: return SDL_SCANCODE_F12;
-
-        case Key::Unknown: break;
-        }
-        // No default: adding a Key without a mapping is then a compiler warning
-        // rather than a silently dead binding.
-        return SDL_SCANCODE_UNKNOWN;
+        // Previous state clears too: a key held before focus was lost must not
+        // register as a release edge on the frame focus comes back.
+        m_previousKeys.fill(false);
+        m_previousMouseButtons.fill(false);
+        m_wheelDelta = 0.0f;
     }
 
     int Input::ToMouseButtonIndex(Uint8 sdlButton)

@@ -9,8 +9,8 @@
 --            width/height (tiles), cell_size, seed, weights,
 --            tiles = {"name", ...} or colors = {{r,g,b,a}, ...} shorthand
 --            (colors auto-define tile types named color_1, color_2, ...)
---   editor — camera: pan_speed, zoom_min, zoom_max,
---            keys = { up = "W", down = "S", left = "A", right = "D" }
+--   editor — camera: pan_speed, zoom_min, zoom_max
+--            (key bindings live in config/input.json, not here)
 --
 -- Map generation and rendering run in C++; this file only configures them.
 -- Press F5 in the engine to re-run it (regenerates the map).
@@ -34,5 +34,4 @@ editor = {
     pan_speed = 900,
     zoom_min  = 0.125,
     zoom_max  = 8.0,
-    keys = { up = "W", down = "S", left = "A", right = "D" },
 }

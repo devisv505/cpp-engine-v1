@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 
-#include <SDL3/SDL_keyboard.h>
 
 #include "core/Log.h"
 
@@ -11,15 +10,6 @@ namespace engine {
 
 namespace {
 
-SDL_Keycode ResolveKey(const std::string& name, SDL_Keycode fallback)
-{
-    const SDL_Keycode key = SDL_GetKeyFromName(name.c_str());
-    if (key == SDLK_UNKNOWN) {
-        LOG_WARN("editor.keys: unknown key name '%s'", name.c_str());
-        return fallback;
-    }
-    return key;
-}
 
 } // namespace
 
@@ -28,10 +18,6 @@ void EditorCamera::Configure(const EditorConfig& config, int mapWidthPx, int map
     m_panSpeed = config.panSpeed;
     m_zoomMin  = std::max(0.01f, config.zoomMin);
     m_zoomMax  = std::max(m_zoomMin, config.zoomMax);
-    keyUp      = ResolveKey(config.keyUp, SDLK_W);
-    keyDown    = ResolveKey(config.keyDown, SDLK_S);
-    keyLeft    = ResolveKey(config.keyLeft, SDLK_A);
-    keyRight   = ResolveKey(config.keyRight, SDLK_D);
 
     m_x = mapWidthPx * 0.5f;
     m_y = mapHeightPx * 0.5f;

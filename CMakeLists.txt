@@ -80,6 +80,7 @@ add_executable(engine
         src/core/math/Vector2.h
         src/core/math/Vector2Int.h
         src/core/input/Input.cpp
+        src/core/input/InputMap.cpp
         src/core/events/EventBus.h)
 
 target_include_directories(engine PRIVATE src third_party)
@@ -154,6 +155,9 @@ add_custom_target(engine_data
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_SOURCE_DIR}/config/window.json"
           "$<TARGET_FILE_DIR:engine>/config/window.json"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/config/input.json"
+          "$<TARGET_FILE_DIR:engine>/config/input.json"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CMAKE_SOURCE_DIR}/scripts"
           "$<TARGET_FILE_DIR:engine>/scripts"

@@ -72,6 +72,7 @@ bool Application::Init()
     m_baseDir = BaseDir();
 
     m_config = LoadWindowConfig(m_baseDir + "config/window.json");
+    m_inputMap.Load(m_baseDir + "config/input.json");
 
     m_renderer = CreateRenderer();
     LOG_INFO("Renderer backend: %s", m_renderer->GetBackendName());
@@ -143,18 +144,15 @@ bool Application::RebuildWorld()
     m_camera.Configure(m_world.editor,
                        static_cast<int>(m_map.Width() * kTileSizePx),
                        static_cast<int>(m_map.Height() * kTileSizePx));
-    m_panUp = m_panDown = m_panLeft = m_panRight = false;
+    m_input.Clear();  // a rebuild should not inherit keys held during the old world
     return true;
 }
 
 void Application::HandleEvent(const SDL_Event& event, bool& running)
 {
-    // Mouse coordinates arrive in window points; the camera works in
-    // framebuffer pixels, so scale by the pixel density.
-    int pixelW = 0, pixelH = 0, logicalW = 0, logicalH = 0;
-    m_window.GetPixelSize(pixelW, pixelH);
-    SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
-    const float scale = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
+    // Input records device state; Update() reads it. Only events that carry
+    // information no amount of polling could recover stay in the switch below.
+    m_input.ProcessEvent(event);
 
     switch (event.type) {
         case SDL_EVENT_QUIT:
@@ -171,53 +169,63 @@ void Application::HandleEvent(const SDL_Event& event, bool& running)
             m_renderer->OnResize(event.window.data1, event.window.data2);
             break;
 
-        case SDL_EVENT_MOUSE_WHEEL:
-            m_camera.OnMouseWheel(event.wheel.y, event.wheel.mouse_x * scale,
-                                  event.wheel.mouse_y * scale);
-            break;
-
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-            if (event.button.button == SDL_BUTTON_MIDDLE) {
-                m_camera.BeginDrag(event.button.x * scale, event.button.y * scale);
-            }
-            break;
-
-        case SDL_EVENT_MOUSE_BUTTON_UP:
-            if (event.button.button == SDL_BUTTON_MIDDLE) {
-                m_camera.EndDrag();
-            }
-            break;
-
-        case SDL_EVENT_KEY_DOWN:
-        case SDL_EVENT_KEY_UP: {
-            const bool down = event.type == SDL_EVENT_KEY_DOWN;
-            if (down) {
-                if (event.key.key == SDLK_F5 && !event.key.repeat) {
-                    LOG_INFO("Reloading script and regenerating the world");
-                    RebuildWorld();
-                    return;
-                }
-                if (event.key.key == SDLK_ESCAPE) {
-                    running = false;
-                    return;
-                }
-            }
-            if (event.key.key == m_camera.keyUp)    m_panUp    = down;
-            if (event.key.key == m_camera.keyDown)  m_panDown  = down;
-            if (event.key.key == m_camera.keyLeft)  m_panLeft  = down;
-            if (event.key.key == m_camera.keyRight) m_panRight = down;
+        default:
             break;
     }
+}
 
-    default:
-        break;
+bool Application::Update(const float deltaTime)
+{
+    int pixelW = 0, pixelH = 0, logicalW = 0, logicalH = 0;
+    m_window.GetPixelSize(pixelW, pixelH);
+    SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
+
+    // Input reports window points; the camera works in framebuffer pixels.
+    const float   scale = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
+    const Vector2 mouse = m_input.GetMousePosition() * scale;
+
+    // One-shot actions: the press edge, so holding the key does not repeat.
+    if (m_inputMap.WasPressed(m_input, Action::Quit)) {
+        return false;
     }
+    if (m_inputMap.WasPressed(m_input, Action::ReloadScript)) {
+        LOG_INFO("Reloading script and regenerating the world");
+        RebuildWorld();
+        return true;
+    }
+
+    Vector2 direction{};
+    if (m_inputMap.IsDown(m_input, Action::CameraUp))    direction.y -= 1.0f;
+    if (m_inputMap.IsDown(m_input, Action::CameraDown))  direction.y += 1.0f;
+    if (m_inputMap.IsDown(m_input, Action::CameraLeft))  direction.x -= 1.0f;
+    if (m_inputMap.IsDown(m_input, Action::CameraRight)) direction.x += 1.0f;
+    m_camera.SetPanInput(direction.x, direction.y);
+
+    if (const float wheel = m_input.GetWheelDelta(); wheel != 0.0f) {
+        m_camera.OnMouseWheel(wheel, mouse.x, mouse.y);
+    }
+
+    // Edges, not held state: re-anchoring the drag every frame would pin the
+    // map to the cursor and it would never move.
+    if (m_input.WasMouseButtonPressed(MouseButton::Middle)) {
+        m_camera.BeginDrag(mouse.x, mouse.y);
+    }
+    if (m_input.WasMouseButtonReleased(MouseButton::Middle)) {
+        m_camera.EndDrag();
+    }
+
+    m_camera.Update(deltaTime, mouse.x, mouse.y, pixelW, pixelH);
+    return true;
 }
 
 void Application::MainLoop()
 {
     bool running = true;
     while (running) {
+        // Advances the input state when it goes out of scope, whatever path
+        // this iteration takes out of the loop body.
+        const InputFrame inputFrame(m_input);
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             HandleEvent(event, running);
@@ -228,16 +236,7 @@ void Application::MainLoop()
         m_lastFrameNs  = nowNs;
         UpdateFps(dt);
 
-        float mouseX = 0.0f, mouseY = 0.0f;
-        SDL_GetMouseState(&mouseX, &mouseY);
-        int pixelW = 0, pixelH = 0, logicalW = 0, logicalH = 0;
-        m_window.GetPixelSize(pixelW, pixelH);
-        SDL_GetWindowSize(m_window.GetSDLWindow(), &logicalW, &logicalH);
-        const float scale = logicalW > 0 ? static_cast<float>(pixelW) / logicalW : 1.0f;
-
-        m_camera.SetPanInput(static_cast<float>(m_panRight) - static_cast<float>(m_panLeft),
-                             static_cast<float>(m_panDown) - static_cast<float>(m_panUp));
-        m_camera.Update(dt, mouseX * scale, mouseY * scale, pixelW, pixelH);
+        running = Update(dt);
 
         int dx = 0, dy = 0, dw = 0, dh = 0;
         if (m_map.TakeDirtyRegion(dx, dy, dw, dh)) {
