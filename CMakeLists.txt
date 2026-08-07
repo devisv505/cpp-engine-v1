@@ -75,7 +75,8 @@ add_executable(engine
   src/world/MapIO.cpp
   src/world/TileAtlas.cpp
   src/editor/EditorCamera.cpp
-  src/renderer/RendererFactory.cpp)
+  src/renderer/RendererFactory.cpp
+        src/core/input/Input.h)
 
 target_include_directories(engine PRIVATE src third_party)
 target_link_libraries(engine PRIVATE SDL3::SDL3 lua)

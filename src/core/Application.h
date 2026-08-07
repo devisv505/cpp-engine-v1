@@ -34,6 +34,8 @@ private:
     // atlas, generated map, GPU tile resources, camera.
     bool RebuildWorld();
     void HandleEvent(const SDL_Event& event, bool& running);
+    void UpdateFps(float frameSeconds);
+    void DrawFpsOverlay();
     void RenderFrame();
 
     WindowConfig               m_config;
@@ -49,9 +51,15 @@ private:
     EditorCamera m_camera;
 
     uint64_t m_lastFrameNs = 0;
+    float    m_fpsElapsed  = 0.0f;
+    uint32_t m_fpsFrames   = 0;
+    uint32_t m_displayFps  = 0;
 
     // Keyboard pan state (configurable keys, see EditorConfig).
-    bool m_panUp = false, m_panDown = false, m_panLeft = false, m_panRight = false;
+    bool m_panUp = false;
+    bool m_panDown = false;
+    bool m_panLeft = false;
+    bool m_panRight = false;
 };
 
 } // namespace engine
